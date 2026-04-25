@@ -1,6 +1,6 @@
 # textclap — CLAP Inference Library Design
 
-**Status:** Draft (revision 7, post-rev-6 review)
+**Status:** Draft (revision 8 — pipeline correction: audio path is fixed 10 s windows, no VAD)
 **Date:** 2026-04-25
 **Target version:** 0.1.0
 
@@ -18,38 +18,67 @@ exports are expected to work (same I/O contract) but have not been measured. See
 
 ### 1.1 Pipeline and the role of CLAP within it
 
+The user-facing search experience is "find audio matching this text query." textclap's two encoders make
+this work via **two independent indexing paths** — both producing 512-dim embeddings in CLAP's shared
+audio/text space, both stored in lancedb, both searchable from a text query.
+
+```text
+                                  ┌─ audio path (fixed 10 s windows of the source audio) ─┐
+                                  │   decoder → resample to 48 kHz → buffer 10 s          │
+                                  │       → AudioEncoder::embed → 512-dim embedding       │
+audio frames                      │                                                        │
+(native rate, e.g. 44.1/48 kHz) ──┤                                                        │
+                                  │                                                        │
+                                  ├─ text path (speech transcription via STT) ─────────────┤
+                                  │   decoder → resample to 16 kHz → silero VAD            │
+                                  │       → speech segments → Whisper STT → transcripts   │
+                                  │       → TextEncoder::embed → 512-dim embedding         │
+                                  └────────────────────────────────────────────────────────┘
+                                                          ↓
+                                                  lancedb / vector store
+                                                          ↑
+        (query) text → TextEncoder::embed → cosine similarity against either column
 ```
-audio frames → silero (VAD)         [16 kHz internally]   → speech segment boundaries
-            → STT (e.g. Whisper)    [whatever rate it wants] → transcripts per segment
-            → textclap audio encoder [48 kHz, ≤10 s clip]  → 512-dim audio embedding per segment
-            → textclap text encoder  [text in]              → 512-dim text embedding per transcript
-            → store both in lancedb (or any Arrow-based vector DB)
-            → query: text → text encoder → cosine similarity search
-```
 
-**Sample-rate mismatch is the caller's problem.** silero requires 16 kHz mono; CLAP requires 48 kHz mono.
-textclap does not resample. Realistic deployment: the source audio arrives in some native rate (commonly
-48 kHz from microphones or 44.1 kHz from media files); the caller resamples to 16 kHz for silero; silero
-returns segment boundaries in *time* (e.g. via `mediatime::TimeRange`); the caller slices the *original
-48 kHz* audio at those boundaries and feeds that slice to textclap. `examples/vad_to_clap.rs` demonstrates
-this with `rubato`.
+The two paths are **independent**. They share the source audio stream but otherwise don't interact — the
+audio encoder does *not* slice on speech segments; it processes **fixed 10-second windows of the entire
+stream**. The text encoder feeds on Whisper transcripts of speech segments only. A text query embedding can
+then search either column (or both) since they live in the same 512-dim CLAP space.
 
-### 1.2 What CLAP does — and doesn't do — on speech segments
+**Why fixed 10-second windows on the audio side, no VAD.** CLAP is a general-audio model trained on
+AudioSet — it captures speech, music, ambient sounds, environmental noise, alarms, animals, traffic, all of
+it. The right input is the whole audio stream chunked into windows the model was trained on (10 s).
+Pre-segmenting to "speech only" or "non-silence" would discard exactly the non-speech context CLAP excels
+at recognizing. The decoder hands textclap a 10 s buffer of 48 kHz mono `f32` PCM; textclap embeds it; the
+caller does this every 10 s of input.
 
-**Domain-of-training mismatch.** CLAP-HTSAT-unfused was trained on AudioSet plus general-audio captions, not
-on conversational speech. Speech segments embedded through the audio encoder cluster tightly in CLAP-audio
-space and do not discriminate well *between speech contents* — that's not the model's job. In the pipeline
-above, the audio embedding captures **non-speech acoustic context accompanying the speech** (background
-sounds, ambience, music, dog barks behind a conversation, traffic noise); discrimination between *what was
-said* lives on the **text** branch (Whisper transcript → CLAP text encoder).
+**Sample-rate handling is the caller's problem.** silero requires 16 kHz mono; CLAP requires 48 kHz mono.
+textclap does not resample. The decoder typically resamples each branch independently from the native
+source rate. Both branches consume the same underlying audio, just at different sample rates.
 
-**Short-segment artifacts.** CLAP expects 10 s of audio. textclap's repeat-pad fills shorter clips by tiling,
-which produces real periodicity artifacts in the mel spectrogram (e.g. a 1 s segment tiled to 10 s creates a
-1 Hz repetition pattern and 10 identical positional patches in HTSAT's input). **Recommended minimum is
-~2.5 s of original content** (matching the §7.8 trailing-chunk-skip threshold of `window/4`). Below that,
-embeddings occupy a region of CLAP-audio space the model wasn't trained on. silero VAD routinely emits
-200–400 ms segments — callers should merge or drop those before reaching `embed`. A `pad_mode: silence`
-alternative is a §14 follow-up.
+`examples/audio_window_to_clap.rs` demonstrates the audio path (decoder → 48 kHz resample → 10 s window →
+embed). The STT branch is left out of 0.1.0 examples to avoid pulling Whisper as a dev-dep; it is documented
+in the README and a `stt_to_clap_text.rs` example is a §14 follow-up.
+
+### 1.2 What CLAP recognizes — and doesn't
+
+**Domain-of-training.** CLAP-HTSAT-unfused was trained on AudioSet plus general-audio captions: it
+discriminates speech-vs-music-vs-ambient, recognizes specific sound categories (dog barks, alarms, traffic,
+machinery, water, applause), and tracks coarse acoustic scene attributes. **It does not discriminate within
+speech** — different conversations cluster together in CLAP-audio space because their acoustic features
+(speech-band energy, voiced/unvoiced patterns, prosody) are similar regardless of content.
+
+For "what was said" queries, the **text branch via STT** does the work (transcripts → text encoder). For
+"what kind of sound is this" queries, the **audio branch** does. A pipeline using both indexes both kinds
+of recall in the same vector space.
+
+**Short-clip artifacts (off the recommended path).** If callers feed `embed()` with clips shorter than 10 s
+— e.g. per-VAD-segment for a different use case — textclap's repeat-pad fills the window by tiling, which
+produces real periodicity artifacts in the mel spectrogram (e.g. a 1 s clip tiled to 10 s creates a 1 Hz
+repetition pattern and 10 identical positional patches in HTSAT's input). Recommended minimum for that
+non-default flow is ~2.5 s of original content (matching the §7.8 trailing-chunk-skip threshold of
+`window/4`). For the recommended fixed-window flow (§1.1), this never triggers — every input is exactly
+10 s. A `pad_mode: silence` alternative for short clips is a §14 follow-up.
 
 ## 2. Non-goals
 
@@ -239,7 +268,7 @@ textclap/
 │   └── bench_text_encode.rs
 ├── examples/
 │   ├── index_and_search.rs          # end-to-end pipeline shape (lancedb stubbed)
-│   └── vad_to_clap.rs               # silero (16 kHz) + rubato resample → textclap (48 kHz)
+│   └── audio_window_to_clap.rs      # decoder → 48 kHz resample → 10 s window → AudioEncoder::embed
 └── docs/superpowers/specs/
 ```
 
@@ -279,17 +308,17 @@ require a coordinated change across the sibling crates.
 
 ### Dev-dependencies
 
-| Crate        | Version | Used by                                |
-|--------------|---------|----------------------------------------|
-| `criterion`  | `^0.5`  | `benches/`                             |
-| `silero`     | path    | `examples/vad_to_clap.rs`              |
-| `mediatime`  | path    | `examples/vad_to_clap.rs`              |
-| `rubato`     | `^0.16` | `examples/vad_to_clap.rs` (resampling) |
-| `npyz`       | `^0.8`  | `tests/clap_integration.rs` (.npy reader) |
-| `hound`      | `^3`    | `tests/clap_integration.rs` (WAV reader) |
+| Crate        | Version | Used by                                                    |
+|--------------|---------|------------------------------------------------------------|
+| `criterion`  | `^0.5`  | `benches/`                                                 |
+| `rubato`     | `^0.16` | `examples/audio_window_to_clap.rs` (44.1 → 48 kHz resample) |
+| `npyz`       | `^0.8`  | `tests/clap_integration.rs` (.npy reader)                  |
+| `hound`      | `^3`    | `tests/clap_integration.rs` (WAV reader)                   |
 
-`silero` / `mediatime` are referenced via path-deps. `examples/` are marked `publish = false` so the
-published crate's `cargo build --examples` does not depend on the workspace layout.
+`examples/` are marked `publish = false` so the published crate's `cargo build --examples` does not need
+non-published path-deps. `silero` and `mediatime` are not direct dev-deps in 0.1.0 — the kept example shows
+only the audio path (no VAD), and the STT branch (which would use silero / Whisper) is a §14 follow-up
+example.
 
 ### Cargo.toml shape (matching siblings)
 
@@ -1125,7 +1154,7 @@ then either widened with documentation or papered over with a per-OS budget tabl
 textclap is currently the bare `al8n/template-rs` scaffold.
 
 ### Replace
-- `Cargo.toml` (identity, deps, dev-deps including silero/mediatime/rubato, features, MSRV, version 0.1.0,
+- `Cargo.toml` (identity, deps, dev-deps including rubato/npyz/hound/criterion, features, MSRV, version 0.1.0,
   caret-pinned `ort`, `examples` marked `publish = false`, `[lints.rust]` block, `[package.metadata.docs.rs]`,
   `include = [...]` whitelist excluding `tests/fixtures/`).
 - `README.md` — purpose, install, quick-start (`Clap::from_files` → `warmup()` → audio embed + text embed +
@@ -1133,14 +1162,15 @@ textclap is currently the bare `al8n/template-rs` scaffold.
   warning that `tokenizer.json` must come from the same Xenova export (not from
   `laion/clap-htsat-unfused` directly), model-attribution-on-downstream section (§11.6), ort-coupling note,
   license, lancedb integration snippet, deployment note that thread-per-core means each worker calls
-  `from_files` **sequentially at startup** with **150–300 MB resident per worker**, pipeline example showing
-  48-vs-16 kHz handling, **§1.2 short-segment minimum recommendation (~2.5 s) and speech-domain caveat**,
-  thread-tuning note pointing users to `from_ort_session` for thread/EP configuration.
+  `from_files` **sequentially at startup** with **150–300 MB resident per worker**, **the §1.1 two-path
+  pipeline diagram** (audio = fixed 10 s windows, text = silero VAD → STT branch — independent paths into
+  the same lancedb), §1.2 domain-of-training and short-clip caveats, thread-tuning note pointing users to
+  `from_ort_session` for thread/EP configuration.
 - `src/lib.rs` (keep crate-level lints; replace body with module decls and the explicit re-exports listed
   in §4).
 - `tests/foo.rs` → delete.
 - `benches/foo.rs` → delete.
-- `examples/foo.rs` → delete; add `examples/index_and_search.rs` and `examples/vad_to_clap.rs`.
+- `examples/foo.rs` → delete; add `examples/index_and_search.rs` and `examples/audio_window_to_clap.rs`.
 - `CHANGELOG.md` → reset to Keep-a-Changelog stub starting at `[0.1.0]`.
 
 ### Keep
@@ -1154,9 +1184,10 @@ textclap is currently the bare `al8n/template-rs` scaffold.
 - `tests/fixtures/` contents per §3 / §12.2 (including `README.md` for sample.wav provenance and `MODELS.md`
   for model SHA256s).
 - `examples/index_and_search.rs` — pipeline shape, lancedb stubbed.
-- `examples/vad_to_clap.rs` — full audio path: 48 kHz source → `rubato` resample to 16 kHz → silero VAD →
-  segment time ranges (`mediatime::TimeRange`) → slice the *original* 48 kHz audio at those times →
-  `textclap::AudioEncoder::embed`.
+- `examples/audio_window_to_clap.rs` — the §1.1 audio path: source frames at native rate (the example uses
+  44.1 kHz) → `rubato` resample to 48 kHz → buffer 10 s of samples → `AudioEncoder::embed` → 512-dim
+  `Embedding` → push to a stubbed lancedb writer. No VAD; no per-segment slicing. Demonstrates the
+  fixed-window flow that's the recommended deployment.
 - This spec under `docs/superpowers/specs/`.
 
 ### lancedb integration snippet (for README)
@@ -1197,6 +1228,10 @@ let sim = query.cosine(&stored);
 - An optional **strict LAION-reference mode** for `embed_chunked` — single-window rand_trunc with a
   caller-provided RNG seed.
 - A doctest on `Embedding::cosine` showing the lancedb round-trip specifically.
+- An `examples/stt_to_clap_text.rs` example showing the §1.1 text branch: source frames → 16 kHz resample
+  → silero VAD → speech segments (`mediatime::TimeRange`) → Whisper STT → transcripts → `TextEncoder::embed`
+  → `Embedding`. Held out of 0.1.0 because it pulls Whisper as a dev-dep and the STT integration is
+  separately involved enough that it deserves its own example with its own choices.
 - `tracing` feature for service-tier observability.
 - `try_reserve_exact` on scratch resizes to surface OOM as `Error::ScratchAlloc` instead of panic.
 - `Options::with_truncation_warn_threshold(usize)` to log when text inputs hit the silent truncation cap.
