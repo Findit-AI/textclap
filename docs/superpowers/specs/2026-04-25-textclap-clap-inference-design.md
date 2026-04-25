@@ -193,8 +193,8 @@ the door open for swapping in larger CLAP variants without breaking dependents.
 
 ```rust
 pub struct Clap          { /* AudioEncoder + TextEncoder */ }
-pub struct AudioEncoder  { /* Arc<ort::Session> + Arc<MelExtractor> + encoder-owned scratch */ }
-pub struct TextEncoder   { /* Arc<ort::Session> + Tokenizer + cached pad_id + encoder-owned scratch */ }
+pub struct AudioEncoder  { /* ort::Session + MelExtractor + encoder-owned scratch */ }
+pub struct TextEncoder   { /* ort::Session + Tokenizer + cached pad_id + encoder-owned scratch */ }
 
 pub struct Embedding     { /* invariant: L2-normalized, internal storage [f32; 512] */ }
 
@@ -207,10 +207,12 @@ pub struct ChunkingOptions { /* private */ }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 ```
 
-`AudioEncoder` and `TextEncoder` hold their `ort::Session` and (for audio) the immutable mel-extractor state
-(filterbank, Hann window, FFT planner) behind `Arc`s. This makes `try_clone_with_shared_session` (§7.3, §7.4)
-a cheap operation that spawns a sibling encoder for another worker thread without re-loading the 33 MB / 121 MB
-model weights. Mutable scratch is never shared.
+`AudioEncoder` and `TextEncoder` own their `ort::Session` and (for audio) the mel-extractor state
+(filterbank, Hann window, FFT planner) by value. There is no internal `Arc`, no clone-with-shared-session,
+and no cross-thread session sharing. **The deployment model is thread-per-core**: each worker thread loads
+its own encoder once at startup and runs forever. The ~154 MB resident per worker (33 MB int8 audio model +
+121 MB int8 text model) is the deliberate trade for predictable latency and zero synchronization overhead in
+the inference path.
 
 ### 7.2 `Clap`
 
@@ -226,12 +228,6 @@ impl Clap {
 
     pub fn audio_mut(&mut self) -> &mut AudioEncoder;
     pub fn text_mut(&mut self)  -> &mut TextEncoder;
-
-    /// Spawn a sibling Clap that shares both ONNX sessions (Arc) and immutable
-    /// mel-extractor state, but allocates fresh scratch. For thread-per-core
-    /// service deployment: load once, clone per worker. Memory cost is
-    /// O(workers · scratch), not O(workers · model_weights).
-    pub fn try_clone_with_shared_session(&self) -> Result<Self>;
 
     /// Run a dummy forward through both encoders to amortize ORT operator
     /// specialization (typically 5–20× cold-start cost on first run) and
@@ -283,23 +279,18 @@ impl AudioEncoder {
     /// (repeat-padded). Empty input returns Error::EmptyAudio.
     pub fn embed_chunked(&mut self, samples: &[f32], opts: &ChunkingOptions) -> Result<Embedding>;
 
-    /// Spawn a sibling AudioEncoder sharing the underlying Arc<Session> and
-    /// Arc<MelExtractor>; fresh scratch is allocated. See Clap::try_clone_with_shared_session.
-    pub fn try_clone_with_shared_session(&self) -> Result<Self>;
-
     /// See Clap::warmup. Same caveat: sizes scratch for batch size 1 only.
     pub fn warmup(&mut self) -> Result<()>;
 }
 ```
 
 **Concurrency model:** `AudioEncoder` is `Send` but **not `Sync`**. Each worker thread owns its own
-`AudioEncoder`; this matches the thread-per-core architecture this crate is designed for. The encoder owns
-its mel feature buffer, FFT scratch, and ONNX input tensor backing as growable `Vec<f32>`s. They are
-sized on the first call (or amortized via `warmup()`) and reused for the encoder's lifetime via
-`Vec::resize_with` (which preserves capacity) — the hot path performs no heap allocation after warmup.
-Service layers needing concurrency construct one encoder per worker via `try_clone_with_shared_session`:
-the underlying ONNX session and immutable mel-extractor state are `Arc`-shared, so memory cost scales with
-`O(workers · scratch)` rather than `O(workers · model_weights)`.
+`AudioEncoder` — thread-per-core, no sharing. The encoder owns its mel feature buffer, FFT scratch, and ONNX
+input tensor backing as growable `Vec<f32>`s. They are sized on the first call (or amortized via `warmup()`)
+and reused for the encoder's lifetime via `Vec::resize_with` (which preserves capacity) — the hot path
+performs no heap allocation after warmup. Service layers spawn N workers, each calling `from_files` (or
+`from_memory`) once at startup; the resulting N independent ONNX sessions duplicate the model weights, which
+is the intended trade for synchronization-free inference.
 
 ### 7.3.1 Expected segment length (your VAD pipeline)
 
@@ -335,18 +326,14 @@ impl TextEncoder {
     /// returns Error::EmptyInput.
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Embedding>>;
 
-    /// See AudioEncoder::try_clone_with_shared_session.
-    pub fn try_clone_with_shared_session(&self) -> Result<Self>;
-
     pub fn warmup(&mut self) -> Result<()>;
 }
 ```
 
 **Concurrency model:** `TextEncoder` is `Send` but **not `Sync`** (matches `AudioEncoder`; same thread-per-core
-rationale). Encoder-owned scratch (`Vec<i64>` for token ids and attention mask) is grown on demand via
-`Vec::resize_with` and reused for the encoder's lifetime; the hot path is allocation-free after warmup.
-`try_clone_with_shared_session` is the standard way to spawn a sibling encoder for another worker — the ONNX
-session is `Arc`-shared, the `Tokenizer` is cheap to `Clone` (its own internal Arc), and only scratch is fresh.
+rationale, same independent-per-worker construction story). Encoder-owned scratch (`Vec<i64>` for token ids and
+attention mask) is grown on demand via `Vec::resize_with` and reused for the encoder's lifetime; the hot path
+is allocation-free after warmup.
 
 The attention mask is critical — RoBERTa's position calculation is `pad_id + 1 + cumsum(non_pad_mask)`,
 which is inlined into the Xenova ONNX export but only produces correct results if the mask is right.
@@ -503,8 +490,7 @@ samples (f32, 48 kHz mono, length L)
   → write into caller-provided [64 × 1000] f32 buffer (row-major, time-major contiguous)
 ```
 
-State allocated once in `new()` and held inside `Arc<MelExtractor>` so multiple sibling encoders (created via
-`AudioEncoder::try_clone_with_shared_session`) can share these read-only tables without re-computing them:
+State allocated once in `new()`, owned by the `MelExtractor`, owned by the `AudioEncoder`:
 - Hann window (`Vec<f32>`, len 1024). Generated as the first 1024 samples of a length-1025 symmetric Hann
   (the periodic convention).
 - Mel filterbank (`Vec<f32>`, len 64 × 513). Generated using Slaney's MEL-scale formula and Slaney
@@ -744,9 +730,7 @@ requirements. A "Model attribution" section in the README points to:
 - **`audio.rs`:** `AudioTooLong` boundary at exactly 480_000 samples, `EmptyAudio` rejection on
   `embed(&[])` / `embed_chunked(&[], ..)` / batch-with-empty-clip (with correct `clip_index`),
   `BatchLengthMismatch` detection, empty batch slice returns empty Vec, chunked windowing offsets and chunk
-  count for representative input lengths and hop sizes, `try_clone_with_shared_session` produces an encoder
-  whose first `embed` allocates new scratch but does not re-load the ONNX session (assert via memory probe
-  or by sharing assertion on the inner `Arc`).
+  count for representative input lengths and hop sizes.
 - **`text.rs`:** `EmptyInput` for empty `&str` and for a batch containing an empty string, empty batch slice
   returns empty Vec, batch padding fills exactly `T_max - len(i)` slots with `pad_id`, special tokens
   prepended/appended.
@@ -832,7 +816,8 @@ lines of lint config, version 0.0.0, no deps, comprehensive but largely-irreleva
   warning that `tokenizer.json` must come from the same Xenova export — *not* from `laion/clap-htsat-unfused`
   on Hugging Face, which differs subtly and produces token-id mismatches that pass tests on common English
   but break on edge cases — model attribution section, ort-coupling note, license, lancedb integration
-  snippet, thread-per-core deployment example using `try_clone_with_shared_session`).
+  snippet, deployment note that thread-per-core means each worker calls `from_files` once at startup
+  (~154 MB resident per worker)).
 - `src/lib.rs` (keep crate-level lints; replace body with module decls and re-exports).
 - `tests/foo.rs` → delete; replaced by per-module unit tests + `tests/clap_integration.rs`.
 - `benches/foo.rs` → delete; replaced by the three Criterion benches.
