@@ -6,11 +6,16 @@
 
 ## 1. Purpose
 
-textclap is a Rust inference library for **CLAP** (Contrastive Language-Audio Pre-training), specifically the
-INT8-quantized `Xenova/clap-htsat-unfused` ONNX export of LAION's `clap-htsat-unfused` model. It exposes both
-the audio (HTSAT) and text (RoBERTa) encoders behind one library, plus a zero-shot classification helper, and
-is built to fit alongside the sibling crates `silero` (VAD), `soundevents` (sound classification), and
+textclap is a Rust inference library for **CLAP** (Contrastive Language-Audio Pre-training). It loads the audio
+(HTSAT) and text (RoBERTa) ONNX encoders of LAION's `clap-htsat-unfused` model — typically the
+`Xenova/clap-htsat-unfused` export — and exposes them alongside a zero-shot classification helper. It is
+designed to fit alongside the sibling crates `silero` (VAD), `soundevents` (sound classification), and
 `mediatime` (rational time primitives) in the Findit-AI ecosystem.
+
+The crate is **precision-agnostic at the API level** — `from_files` / `from_memory` take whatever ONNX bytes
+the caller supplies. **0.1.0 is verified against the INT8-quantized export specifically**; the fp16 and fp32
+exports are expected to work (same I/O contract) but have not been measured. See §11.3 for the
+quantization-tolerance posture.
 
 Pipeline:
 
@@ -33,7 +38,7 @@ does inference per clip or per VAD-derived segment; long inputs are handled by c
 - **Vector store integration.** Embeddings are emitted; storage and ANN search live in the caller.
 - **Model bundling or download helpers.** No models in the crate, no network at build or runtime. Caller supplies file paths or bytes.
 - **Async / runtime ownership.** Synchronous library, like the sibling crates.
-- **Multi-variant CLAP support in 0.1.0.** Only the 512-dim INT8 `Xenova/clap-htsat-unfused` export is verified. The public API does not lock to this dimension (see §7.5), so 1024-dim variants like `larger_clap_general` become an additive change later.
+- **Multi-variant CLAP support in 0.1.0.** Only the 512-dim `Xenova/clap-htsat-unfused` export is verified (against the INT8 quantization specifically). The public API does not lock to this dimension (see §7.5), so 1024-dim variants like `larger_clap_general` become an additive change later. Other precisions (fp16, fp32) of the same architecture are not blocked by the API but are unverified — see §11.3.
 
 ## 3. Pre-implementation prerequisites
 
@@ -58,7 +63,11 @@ A pinned-version Python script `tests/fixtures/regen_golden.py` that:
    - Window function: verify whether it's *periodic* (length+1 generated, last sample dropped — librosa/torch
      convention) or *symmetric* (numpy.hanning convention). Expected: periodic.
    - `padding` mode (expected: `"repeatpad"`)
-   - `truncation` mode (expected: `"rand_trunc"` — but our fixture is ≤10 s, so this never triggers)
+   - `truncation` mode (expected: `"rand_trunc"` — but our fixture is ≤10 s, so this never triggers).
+     The Rust crate uses **deterministic head truncation** for inputs longer than 10 s (see §8.1). Because
+     the test fixture is ≤10 s, neither codepath truncates, so head-vs-rand_trunc divergence is **not
+     exercised in tests**. Deployers feeding >10 s clips through `embed` rather than `embed_chunked` should
+     understand they get head truncation, not the HF default.
    - `frequency_min` / `frequency_max` (expected: 50 / 14000 Hz)
 3. Runs the extractor on the fixture and saves the resulting `[64, 1000]` float array to
    `tests/fixtures/golden_mel.npy`.
@@ -72,6 +81,10 @@ A pinned-version Python script `tests/fixtures/regen_golden.py` that:
 ONNX. Golden audio and text embeddings must come from the same int8 ONNX run in Python — otherwise the test
 tolerance has to absorb both quantization drift *and* implementation differences, and we can't tell them apart.
 Mel goldens still come from `ClapFeatureExtractor` (which is fp32 NumPy and is what the int8 ONNX expects as input).
+
+**To verify a non-int8 setup** (fp16 or fp32), users regenerate the goldens by pointing `regen_golden.py` at
+the alternate ONNX file. The mel golden does not change (preprocessing is precision-independent); only the
+audio and text embedding goldens are recomputed. Tolerances may need to widen — see §11.3.
 
 ### 3.2 ONNX graph IO inspection
 
@@ -109,7 +122,7 @@ textclap/
 ├── src/
 │   ├── lib.rs                      # module decls + public re-exports + crate-level docs
 │   ├── error.rs                    # Error enum (thiserror)
-│   ├── options.rs                  # Options, ChunkingOptions, Aggregation
+│   ├── options.rs                  # Options, ChunkingOptions
 │   ├── mel.rs                      # MelExtractor: STFT → mel filterbank → log-mel
 │   ├── audio.rs                    # AudioEncoder
 │   ├── text.rs                     # TextEncoder
@@ -151,7 +164,7 @@ session API at compile time. Bumping `ort` is a coordinated change across the fo
 
 ### Optional features
 
-- **`serde`** — `Serialize` / `Deserialize` derives on `Options`, `ChunkingOptions`, `Aggregation`,
+- **`serde`** — `Serialize` / `Deserialize` derives on `Options`, `ChunkingOptions`,
   `LabeledScore`, `LabeledScoreOwned`, and `Embedding` (sequence form, length 512).
 
 ### Excluded (deliberate)
@@ -173,15 +186,15 @@ session API at compile time. Bumping `ort` is a coordinated change across the fo
 
 All public structs use private fields and accessor methods, matching silero/soundevents/mediatime conventions.
 Builder-style `with_*` methods return `Self` by value; getters return references or `Copy` values. Field-less
-unit enums (`Aggregation`, `Error` variants) are public-as-data. **No public signature exposes `[f32; 512]`** —
-this keeps the door open for swapping in larger CLAP variants without breaking dependents.
+unit enums (`Error` variants) are public-as-data. **No public signature exposes `[f32; 512]`** — this keeps
+the door open for swapping in larger CLAP variants without breaking dependents.
 
 ### 7.1 Top-level types
 
 ```rust
 pub struct Clap          { /* AudioEncoder + TextEncoder */ }
-pub struct AudioEncoder  { /* ort::Session + MelExtractor + encoder-owned scratch */ }
-pub struct TextEncoder   { /* ort::Session + Tokenizer + cached pad_id + encoder-owned scratch */ }
+pub struct AudioEncoder  { /* Arc<ort::Session> + Arc<MelExtractor> + encoder-owned scratch */ }
+pub struct TextEncoder   { /* Arc<ort::Session> + Tokenizer + cached pad_id + encoder-owned scratch */ }
 
 pub struct Embedding     { /* invariant: L2-normalized, internal storage [f32; 512] */ }
 
@@ -191,11 +204,13 @@ pub struct LabeledScoreOwned     { /* private; owns label */ }
 pub struct Options       { /* private */ }
 pub struct ChunkingOptions { /* private */ }
 
-#[non_exhaustive]
-pub enum Aggregation { Mean }   // 0.1.0 ships Mean only; enum kept extensible
-
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 ```
+
+`AudioEncoder` and `TextEncoder` hold their `ort::Session` and (for audio) the immutable mel-extractor state
+(filterbank, Hann window, FFT planner) behind `Arc`s. This makes `try_clone_with_shared_session` (§7.3, §7.4)
+a cheap operation that spawns a sibling encoder for another worker thread without re-loading the 33 MB / 121 MB
+model weights. Mutable scratch is never shared.
 
 ### 7.2 `Clap`
 
@@ -212,9 +227,19 @@ impl Clap {
     pub fn audio_mut(&mut self) -> &mut AudioEncoder;
     pub fn text_mut(&mut self)  -> &mut TextEncoder;
 
+    /// Spawn a sibling Clap that shares both ONNX sessions (Arc) and immutable
+    /// mel-extractor state, but allocates fresh scratch. For thread-per-core
+    /// service deployment: load once, clone per worker. Memory cost is
+    /// O(workers · scratch), not O(workers · model_weights).
+    pub fn try_clone_with_shared_session(&self) -> Result<Self>;
+
     /// Run a dummy forward through both encoders to amortize ORT operator
     /// specialization (typically 5–20× cold-start cost on first run) and
     /// to size the encoder-owned scratch buffers.
+    ///
+    /// `warmup()` only sizes scratch for batch size 1. Workloads that batch
+    /// (e.g. embedding many Whisper transcripts at once) will see one extra
+    /// scratch growth on the first batched call.
     pub fn warmup(&mut self) -> Result<()>;
 
     // Single ~10 s clip
@@ -244,17 +269,25 @@ impl AudioEncoder {
     pub fn from_ort_session(session: ort::session::Session, opts: Options) -> Result<Self>;
 
     /// Single clip, length ≤ 480_000 samples (10 s @ 48 kHz). Shorter inputs are
-    /// repeat-padded internally; longer inputs return Error::AudioTooLong.
+    /// repeat-padded internally. Empty input returns Error::EmptyAudio. Inputs
+    /// longer than the window return Error::AudioTooLong.
     pub fn embed(&mut self, samples: &[f32]) -> Result<Embedding>;
 
-    /// N equal-length clips. Empty slice returns Ok(Vec::new()). Uneven lengths
-    /// return Error::BatchLengthMismatch.
+    /// N equal-length clips. Empty *slice* returns Ok(Vec::new()). Any clip of
+    /// length 0 returns Error::EmptyAudio. Uneven lengths return
+    /// Error::BatchLengthMismatch.
     pub fn embed_batch(&mut self, clips: &[&[f32]]) -> Result<Vec<Embedding>>;
 
-    /// Arbitrary-length input. Windows + aggregates per ChunkingOptions. Single
-    /// chunk shorter than the window is handled identically (repeat-padded).
+    /// Arbitrary-length input. Windows + aggregates by mean (the only strategy
+    /// in 0.1.0). Single chunk shorter than the window is handled identically
+    /// (repeat-padded). Empty input returns Error::EmptyAudio.
     pub fn embed_chunked(&mut self, samples: &[f32], opts: &ChunkingOptions) -> Result<Embedding>;
 
+    /// Spawn a sibling AudioEncoder sharing the underlying Arc<Session> and
+    /// Arc<MelExtractor>; fresh scratch is allocated. See Clap::try_clone_with_shared_session.
+    pub fn try_clone_with_shared_session(&self) -> Result<Self>;
+
+    /// See Clap::warmup. Same caveat: sizes scratch for batch size 1 only.
     pub fn warmup(&mut self) -> Result<()>;
 }
 ```
@@ -262,9 +295,11 @@ impl AudioEncoder {
 **Concurrency model:** `AudioEncoder` is `Send` but **not `Sync`**. Each worker thread owns its own
 `AudioEncoder`; this matches the thread-per-core architecture this crate is designed for. The encoder owns
 its mel feature buffer, FFT scratch, and ONNX input tensor backing as growable `Vec<f32>`s. They are
-allocated on the first call (or amortized via `warmup()`) and reused for the encoder's lifetime — the hot
-path performs no heap allocation after warmup. Service layers needing concurrency construct one encoder per
-worker, sharing only the on-disk model file.
+sized on the first call (or amortized via `warmup()`) and reused for the encoder's lifetime via
+`Vec::resize_with` (which preserves capacity) — the hot path performs no heap allocation after warmup.
+Service layers needing concurrency construct one encoder per worker via `try_clone_with_shared_session`:
+the underlying ONNX session and immutable mel-extractor state are `Arc`-shared, so memory cost scales with
+`O(workers · scratch)` rather than `O(workers · model_weights)`.
 
 ### 7.3.1 Expected segment length (your VAD pipeline)
 
@@ -291,16 +326,27 @@ impl TextEncoder {
         session: ort::session::Session, tokenizer: tokenizers::Tokenizer, opts: Options,
     ) -> Result<Self>;
 
+    /// Empty &str returns Error::EmptyInput. Whitespace-only strings are
+    /// accepted as-is (they tokenize to <s> + minimal content + </s>); if the
+    /// caller wants to treat them as empty, it's the caller's job to filter.
     pub fn embed(&mut self, text: &str) -> Result<Embedding>;
+
+    /// Empty *slice* returns Ok(Vec::new()). Any empty string in the batch
+    /// returns Error::EmptyInput.
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Embedding>>;
+
+    /// See AudioEncoder::try_clone_with_shared_session.
+    pub fn try_clone_with_shared_session(&self) -> Result<Self>;
 
     pub fn warmup(&mut self) -> Result<()>;
 }
 ```
 
 **Concurrency model:** `TextEncoder` is `Send` but **not `Sync`** (matches `AudioEncoder`; same thread-per-core
-rationale). Encoder-owned scratch (`Vec<i64>` for token ids and attention mask) is grown on demand and reused
-for the encoder's lifetime; the hot path is allocation-free after warmup.
+rationale). Encoder-owned scratch (`Vec<i64>` for token ids and attention mask) is grown on demand via
+`Vec::resize_with` and reused for the encoder's lifetime; the hot path is allocation-free after warmup.
+`try_clone_with_shared_session` is the standard way to spawn a sibling encoder for another worker — the ONNX
+session is `Arc`-shared, the `Tokenizer` is cheap to `Clone` (its own internal Arc), and only scratch is fresh.
 
 The attention mask is critical — RoBERTa's position calculation is `pad_id + 1 + cumsum(non_pad_mask)`,
 which is inlined into the Xenova ONNX export but only produces correct results if the mask is right.
@@ -315,8 +361,7 @@ is exposed; users wanting overrides build their own `Tokenizer` and use `from_or
 
 ```rust
 impl Embedding {
-    pub const DIM: usize = 512;
-    pub fn dim(&self) -> usize;
+    pub fn dim(&self) -> usize;            // 512 for 0.1.0; runtime-queryable, future-proof
 
     // Borrow-only access — zero-copy ingestion into Arrow / lancedb.
     pub fn as_slice(&self) -> &[f32];
@@ -330,9 +375,11 @@ impl Embedding {
     /// ANN index — a classic, expensive bug.
     pub fn try_from_unit_slice(s: &[f32]) -> Result<Self>;
 
-    /// Construct from a (possibly un-normalized) slice; always normalizes.
-    /// Validates length only.
-    pub fn from_unnormalized_slice(s: &[f32]) -> Result<Self>;
+    /// Construct from any non-zero slice; always re-normalizes to unit length
+    /// (idempotent for input that's already unit-norm). Validates length and
+    /// rejects all-zero input via Error::EmbeddingNotUnitNorm. Use this when
+    /// you have a vector and don't know whether it's normalized.
+    pub fn from_slice_normalizing(s: &[f32]) -> Result<Self>;
 
     // Similarity (== for unit vectors).
     pub fn dot(&self, other: &Embedding) -> f32;
@@ -340,16 +387,25 @@ impl Embedding {
 }
 
 impl AsRef<[f32]> for Embedding;          // delegates to as_slice()
-// derives: Clone, Debug, PartialEq.  No Eq/Hash (f32 isn't totally ordered).
+// derives: Clone, Debug, PartialEq.
+// No Eq / Hash. Bit-pattern equality is incompatible with f32's PartialEq
+// semantics around +0/-0 and NaN; storing embeddings in a HashMap is not a
+// supported pattern (use the ANN index for similarity lookups).
 #[cfg(feature = "serde")] // serializes as a sequence of 512 f32 values.
 ```
 
-**No public method exposes `[f32; 512]`.** Internal storage is `[f32; 512]` for 0.1.0 (cheap, stack-friendly),
-but that detail can change to `Box<[f32]>` later to support 1024-dim CLAP variants without breaking the public
-API.
+**No public method exposes a fixed-size array.** Internal storage is `[f32; 512]` for 0.1.0 (cheap,
+stack-friendly); that detail can change to `Box<[f32]>` later to support 1024-dim CLAP variants without
+breaking the public API. **There is no `pub const DIM`** — code that needs the dimension calls `dim()` or
+`embedding.as_slice().len()`. The lancedb snippet in §13 demonstrates this pattern.
+
+**PartialEq caveat:** `Embedding: PartialEq` compares the full 512-component f32 arrays bitwise after L2
+normalization. Two embeddings produced from the same input on different threads (or even the same thread
+across separate processes) **may not compare equal** if `intra_threads > 1`, due to ORT reduce-order
+non-determinism. Tests that compare embeddings should run with `Options::new().with_intra_threads(1)` (§11.5).
 
 **Invariant:** every `Embedding` returned by this crate is L2-normalized to unit length. Internal constructors
-divide raw ONNX output by its L2 norm; `try_from_unit_slice` validates the invariant; `from_unnormalized_slice`
+divide raw ONNX output by its L2 norm; `try_from_unit_slice` validates the invariant; `from_slice_normalizing`
 re-establishes it.
 
 ### 7.6 `LabeledScore` and `LabeledScoreOwned`
@@ -391,17 +447,20 @@ override.
 
 ```rust
 impl ChunkingOptions {
-    pub fn new() -> Self;                                  // window=480_000, hop=480_000, agg=Mean, batch_size=8
+    pub fn new() -> Self;                                  // window=480_000, hop=480_000, batch_size=8
     pub fn with_window_samples(self, n: usize) -> Self;
     pub fn window_samples(&self) -> usize;
     pub fn with_hop_samples(self, n: usize) -> Self;
     pub fn hop_samples(&self) -> usize;
-    pub fn with_aggregation(self, agg: Aggregation) -> Self;
-    pub fn aggregation(&self) -> Aggregation;
     pub fn with_batch_size(self, n: usize) -> Self;
     pub fn batch_size(&self) -> usize;
 }
 ```
+
+Aggregation strategy is **fixed to mean** in 0.1.0 — there is no `Aggregation` enum and no
+`with_aggregation` setter. A second strategy (max, attention pooling, mean-of-logits, etc.) would be added
+together with the enum and setter in a minor-version bump; until then a single-variant enum carries no
+information and clutters the API. See §14.
 
 Validation runs at use, not at build (matches silero `SpeechOptions`): `embed_chunked` returns
 `Error::ChunkingConfig` if any of `window_samples`, `hop_samples`, or `batch_size` is `0`.
@@ -444,12 +503,13 @@ samples (f32, 48 kHz mono, length L)
   → write into caller-provided [64 × 1000] f32 buffer (row-major, time-major contiguous)
 ```
 
-State allocated once in `new()` and stored as immutable shared data:
+State allocated once in `new()` and held inside `Arc<MelExtractor>` so multiple sibling encoders (created via
+`AudioEncoder::try_clone_with_shared_session`) can share these read-only tables without re-computing them:
 - Hann window (`Vec<f32>`, len 1024). Generated as the first 1024 samples of a length-1025 symmetric Hann
   (the periodic convention).
 - Mel filterbank (`Vec<f32>`, len 64 × 513). Generated using Slaney's MEL-scale formula and Slaney
   normalization (each filter divided by its bandwidth in Hz).
-- `RealFftPlanner<f32>` instance.
+- The real-FFT plan handle from `RealFftPlanner<f32>`.
 
 Per-call (allocated on the call stack or via `Vec::with_capacity`):
 - FFT input buffer (1024 f32), output buffer (513 Complex<f32>), scratch (planner-defined).
@@ -471,31 +531,43 @@ bugs without needing the full integration fixture.
 > a 4-D input; the implementation drops the `1` channel dim if the export uses 3-D.
 
 **`embed(samples)`:**
-1. Validate `samples.len() ≤ 480_000` (else `AudioTooLong`).
-2. Resize the encoder's mel scratch to `[64 × 1000]` (`Vec<f32>::resize`; no-op after first call).
-3. `MelExtractor::extract_into(samples, &mut self.mel_scratch)`.
-4. Build ort tensor `[1, 1, 64, 1000]` (or `[1, 64, 1000]`, per §3.2) f32 backed by scratch.
-5. `session.run()` → output `[1, 512]`.
-6. L2-normalize row 0 → `Embedding`.
+1. Reject empty input: `samples.is_empty()` → `Error::EmptyAudio`. (The mel extractor's repeat-pad logic
+   requires `len ≥ 1` to tile; an empty clip has no defined mel representation.)
+2. Validate `samples.len() ≤ 480_000` (else `AudioTooLong`).
+3. Resize the encoder's mel scratch to `[64 × 1000]` (`Vec::resize_with`; no-op after first call).
+4. `MelExtractor::extract_into(samples, &mut self.mel_scratch)`.
+5. Build ort tensor `[1, 1, 64, 1000]` (or `[1, 64, 1000]`, per §3.2) f32 backed by scratch.
+6. `session.run()` → output `[1, 512]`.
+7. L2-normalize row 0 → `Embedding`.
 
 **`embed_batch(clips)`:**
 1. Empty slice → `Ok(Vec::new())`.
-2. Verify all clips equal length (else `BatchLengthMismatch { first, other }`).
-3. Resize the encoder's mel scratch to `[N × 64 × 1000]`. After the first batch of size `N`, subsequent
-   batches of size ≤ `N` are allocation-free.
-4. For each clip: mel extractor writes into the appropriate row.
-5. One ort tensor `[N, 1, 64, 1000]`, one `session.run()`.
-6. Row-by-row L2-normalize → `Vec<Embedding>`.
+2. Reject any clip with `len == 0` → `Error::EmptyAudio` (with index of first offender for diagnostics).
+3. Verify all clips equal length (else `BatchLengthMismatch { first, other }`).
+4. Resize the encoder's mel scratch to `[N × 64 × 1000]` via `Vec::resize_with`. After the first batch of
+   size `N`, subsequent batches of size ≤ `N` are allocation-free.
+5. For each clip: mel extractor writes into the appropriate row.
+6. One ort tensor `[N, 1, 64, 1000]`, one `session.run()`.
+7. Row-by-row L2-normalize → `Vec<Embedding>`.
 
 **`embed_chunked(samples, opts)`:**
-1. Validate `opts.window_samples > 0 && opts.hop_samples > 0 && opts.batch_size > 0`.
-2. Compute chunk offsets: `0, hop, 2·hop, ...` while `offset < samples.len()`.
-3. Each chunk is `samples[offset .. min(offset + window, len)]`. Trailing short chunk goes through repeat-pad.
+1. Reject empty input: `samples.is_empty()` → `Error::EmptyAudio`.
+2. Validate `opts.window_samples > 0 && opts.hop_samples > 0 && opts.batch_size > 0`.
+3. Compute chunk offsets: `0, hop, 2·hop, ...` while `offset < samples.len()`. (Step 1's empty-input check
+   prevents the case where `hop > samples.len()` produces zero chunks.)
+4. Each chunk is `samples[offset .. min(offset + window, len)]`. Trailing short chunk goes through repeat-pad.
    Single-chunk case (input shorter than window) handled identically.
-4. Process chunks in groups of `opts.batch_size` via `embed_batch`.
-5. Aggregate the resulting embeddings:
-   - `Mean`: component-wise average → L2-normalize → `Embedding`.
-6. Single chunk: skip aggregation (the lone embedding is already unit-norm).
+5. Process chunks in groups of `opts.batch_size` via `embed_batch`.
+6. Aggregate the resulting embeddings by **mean** (the only strategy in 0.1.0): component-wise average →
+   L2-normalize → `Embedding`.
+7. Single chunk: skip aggregation (the lone embedding is already unit-norm).
+
+**Numerical edge case in mean aggregation:** if the chunk embeddings are nearly orthogonal (e.g. radically
+different sound content across windows), their component-wise mean has small norm and the L2-normalize step
+amplifies floating-point noise. In practice this never occurs for natural audio sharing a single
+provenance, but it is theoretically possible. The implementation does not special-case this; the resulting
+direction will be numerically unstable but the embedding is still unit-norm and won't break downstream
+similarity math.
 
 **Allocation budget per call (after warmup):**
 - `embed`: only the output `Embedding`. Mel scratch, FFT scratch, and ONNX input backing live on the encoder.
@@ -563,6 +635,13 @@ pub enum Error {
 
     #[error("audio input length {got} exceeds maximum {max} samples (10 s @ 48 kHz)")]
     AudioTooLong { got: usize, max: usize },
+
+    /// Audio input has length 0. VAD pipelines occasionally emit zero-length
+    /// segments due to frame-quantization edge cases; callers must filter or
+    /// handle this. For batch input, `clip_index` identifies the first
+    /// offending clip; for single-clip input it is `None`.
+    #[error("audio input is empty (clip index: {clip_index:?})")]
+    EmptyAudio { clip_index: Option<usize> },
 
     #[error("batch clips must all be the same length; got lengths {first} and {other}")]
     BatchLengthMismatch { first: usize, other: usize },
@@ -632,10 +711,14 @@ have not been tested." A quantization-tolerance matrix is a §13 follow-up.
 
 First `session.run()` after construction includes ORT operator specialization, which can be 5–20× slower than
 steady-state inference. `AudioEncoder::warmup(&mut self)`, `TextEncoder::warmup(&mut self)`, and
-`Clap::warmup(&mut self)` run a single dummy forward each (silent input for audio, single-char text for text)
-so production paths see steady-state latency from the first real request. The dummy forward also sizes the
-encoder-owned scratch buffers to their typical steady state. README quick-start example calls
-`clap.warmup()?` after construction.
+`Clap::warmup(&mut self)` run a single dummy forward each — 480 000 samples of silence for audio,
+`"hello world"` for text — so production paths see steady-state latency from the first real request. The
+dummy forward also sizes the encoder-owned scratch buffers to the steady-state for batch size 1.
+
+**Caveat:** workloads that batch (e.g. embedding many Whisper transcripts at once) will see one extra
+scratch growth on the first batched call, since `warmup()` only sizes scratch for `N=1`. A
+`warmup_for_batch(audio_n, text_n)` variant is a §14 follow-up if the extra growth turns out to matter in
+practice. README quick-start example calls `clap.warmup()?` after construction.
 
 ### 11.5 Test determinism
 
@@ -658,18 +741,21 @@ requirements. A "Model attribution" section in the README points to:
 - **`mel.rs`:** Hann window numerical correctness (periodic convention), mel filterbank center frequencies,
   filter rows 0 and 32 vs librosa-precomputed reference (tolerance 1e-6), repeat-pad behavior, output buffer
   shape, eps clamp behavior on silence input.
-- **`audio.rs`:** `AudioTooLong` boundary at exactly 480_000 samples, `BatchLengthMismatch` detection, empty
-  batch returns empty Vec, chunked windowing offsets and chunk count for representative input lengths and
-  hop sizes.
+- **`audio.rs`:** `AudioTooLong` boundary at exactly 480_000 samples, `EmptyAudio` rejection on
+  `embed(&[])` / `embed_chunked(&[], ..)` / batch-with-empty-clip (with correct `clip_index`),
+  `BatchLengthMismatch` detection, empty batch slice returns empty Vec, chunked windowing offsets and chunk
+  count for representative input lengths and hop sizes, `try_clone_with_shared_session` produces an encoder
+  whose first `embed` allocates new scratch but does not re-load the ONNX session (assert via memory probe
+  or by sharing assertion on the inner `Arc`).
 - **`text.rs`:** `EmptyInput` for empty `&str` and for a batch containing an empty string, empty batch slice
   returns empty Vec, batch padding fills exactly `T_max - len(i)` slots with `pad_id`, special tokens
   prepended/appended.
 - **`clap.rs`:** `classify` returns top-k in score-descending order, `classify_all` returns one entry per
   input label, ranking stability with tied scores, `LabeledScore::to_owned()` round-trip.
 - **`options.rs`:** Builder methods round-trip through accessors, defaults match documented values.
-- **`Embedding`:** `from_unnormalized_slice` always produces unit-norm output, `try_from_unit_slice` rejects
-  wrong lengths *and* non-unit-norm input (release-mode check), `dot` equals `cosine` for unit inputs,
-  `to_vec` and `as_slice` are byte-equal.
+- **`Embedding`:** `from_slice_normalizing` always produces unit-norm output and rejects all-zero input,
+  `try_from_unit_slice` rejects wrong lengths *and* non-unit-norm input (release-mode check), `dot` equals
+  `cosine` for unit inputs, `to_vec` and `as_slice` are byte-equal, no `pub const DIM` exists.
 
 ### 12.2 Integration test (`tests/clap_integration.rs`)
 
@@ -693,12 +779,18 @@ Assertions:
 | Check                                                          | Tolerance (`max_abs_diff`)         |
 |----------------------------------------------------------------|-------------------------------------|
 | Rust mel features vs `golden_mel.npy`                          | < 1e-4                              |
-| Rust audio embedding vs `golden_audio_emb.npy` (int8 vs int8)  | < 1e-3                              |
-| Rust text embeddings vs `golden_text_embs.npy` (int8 vs int8)  | < 1e-3                              |
+| Rust audio embedding vs `golden_audio_emb.npy` (int8 vs int8)  | < 1e-5                              |
+| Rust text embeddings vs `golden_text_embs.npy` (int8 vs int8)  | < 1e-5                              |
 | `classify_all` ranks `"a dog barking"` first for the dog WAV   | exact ordering                      |
 
-Both audio-embedding and text-embedding goldens come from running the same int8 ONNX in Python (§3.1), so the
-1e-3 tolerance covers floating-point determinism only — not quantization drift.
+Both audio and text goldens are produced by running the **same int8 ONNX** in Python (§3.1) against the
+**same mel features** Rust will compute (the mel test pins those down to 1e-4). The remaining sources of
+divergence are: (a) ORT reduce-order non-determinism — neutralized by `intra_threads(1)` in tests (§11.5);
+(b) float-summation drift across language bindings — sub-ULP for 512-component dot products. The 1e-5
+budget reflects what's actually plausible. A wider budget would mask filterbank, log-floor, or normalization
+bugs that pass the mel test (which uses a separate tolerance) but corrupt embeddings. If real-run measurement
+exceeds 1e-5 systematically, the tolerance is widened with a code comment explaining the source — the change
+must not be silent.
 
 ### 12.3 Doctests
 
@@ -736,8 +828,11 @@ lines of lint config, version 0.0.0, no deps, comprehensive but largely-irreleva
 ### Replace
 - `Cargo.toml` (identity, deps, features, MSRV, version 0.1.0, exact `ort` pin).
 - `README.md` (purpose, install, quick-start including `Clap::from_files` + `warmup()` + audio embed + text
-  embed + zero-shot classify, model-acquisition note pointing to HuggingFace **with SHA256s**, model attribution
-  section, ort-coupling note, license, lancedb integration snippet).
+  embed + zero-shot classify, model-acquisition note pointing to HuggingFace **with SHA256s**, an explicit
+  warning that `tokenizer.json` must come from the same Xenova export — *not* from `laion/clap-htsat-unfused`
+  on Hugging Face, which differs subtly and produces token-id mismatches that pass tests on common English
+  but break on edge cases — model attribution section, ort-coupling note, license, lancedb integration
+  snippet, thread-per-core deployment example using `try_clone_with_shared_session`).
 - `src/lib.rs` (keep crate-level lints; replace body with module decls and re-exports).
 - `tests/foo.rs` → delete; replaced by per-module unit tests + `tests/clap_integration.rs`.
 - `benches/foo.rs` → delete; replaced by the three Criterion benches.
@@ -765,8 +860,9 @@ use textclap::Embedding;
 
 // Ingest (clap is owned mutably by this worker thread):
 let embedding: Embedding = clap.audio_mut().embed(&pcm_48khz_mono)?;
-let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), Embedding::DIM as i32);
-builder.values().append_slice(embedding.as_slice());   // zero-copy from &[f32]
+let dim = embedding.as_slice().len() as i32;          // dimension-agnostic
+let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dim);
+builder.values().append_slice(embedding.as_slice()); // zero-copy from &[f32]
 builder.append(true);
 
 // Query: lancedb takes Vec<f32>
@@ -789,5 +885,10 @@ let sim = query.cosine(&stored);
 - Streaming-friendly batch builder for service layers that accumulate variable-length text inputs across
   request boundaries.
 - Performance comparison against the Python `transformers` reference on representative corpora.
-- `Aggregation::Max` (or other pooling strategies) if a real CLAP use case demonstrates them. Keep
-  `Aggregation` `#[non_exhaustive]` so adding a variant is a minor-version bump.
+- `warmup_for_batch(audio_n: usize, text_n: usize)` if profiling shows the first batched call's scratch
+  growth costs measurable latency (§11.4).
+- A second chunking-aggregation strategy (max, attention pooling, mean-of-logits, etc.) if a real CLAP use
+  case demonstrates value. Adding it brings back the `Aggregation` enum + `ChunkingOptions::with_aggregation`
+  setter as `#[non_exhaustive]` additions in a minor-version bump.
+- A doctest on `Embedding::cosine` showing the lancedb round-trip (`try_from_unit_slice` of a stored vector
+  → `cosine` against the query embedding).
