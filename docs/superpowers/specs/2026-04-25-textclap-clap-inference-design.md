@@ -1,6 +1,6 @@
 # textclap — CLAP Inference Library Design
 
-**Status:** Draft (revision 12, post-rev-11 review)
+**Status:** Draft (revision 13, post-rev-12 review)
 **Date:** 2026-04-25
 **Target version:** 0.1.0
 
@@ -287,9 +287,20 @@ the README.
 1. **Scripts commit:** `regen_golden.py` and `inspect_onnx.py` source.
 2. **Generated-fixtures commit:** `golden_params.json`, `golden_onnx_io.json`, `golden_*.npy`,
    `tests/fixtures/README.md`.
-3. **Spec-update commit:** §8.1 mel parameter table, §8.2 / §9.2 tensor names and shapes, §7.4
-   attention-mask / position_ids description, §11.4 warmup string, §12.2 tolerance table — all replaced
-   with values consistent with the generated fixtures.
+3. **Spec-update commit.** Every TBD value in this spec is replaced with the resolved fixture-derived
+   value. Complete checklist (deletions of "TBD" markers and "expected" qualifiers expected throughout):
+   - §8.1 mel parameter table — `T` (frame count), `top_db`, HTSAT-input-norm action (`none` /
+     `global_mean_std` plus mean/std).
+   - §8.2 — `AUDIO_INPUT_NAME`, `AUDIO_OUTPUT_NAME`, audio input shape (3-D vs 4-D channel dim).
+   - §9.2 — `TEXT_INPUT_IDS_NAME`, `TEXT_ATTENTION_MASK_NAME`, optional `TEXT_POSITION_IDS_NAME`,
+     `TEXT_OUTPUT_NAME`, plus the §7.4 attention-mask / position_ids description (inlined vs
+     externalized).
+   - §7.5 — `AUDIO_OUTPUT_IS_UNIT_NORM` and `TEXT_OUTPUT_IS_UNIT_NORM` const values (the booleans
+     determined by §3.2's static graph inspection of the ONNX-output L2-normalize pattern).
+   - §11.4 — `warmup_text` literal string and the script-measured BPE token count.
+   - §12.2 tolerance table — adjusted if real-run measurement diverges from the §12.2 derived bounds.
+   - §3.4 step 4 readiness check: confirm `ort::session::builder::GraphOptimizationLevel: Copy` at the
+     pinned RC (referenced by §7.7's `pub const fn with_graph_optimization_level`).
 4. **Rust src/ skeleton commit:** module structure, public types with `unimplemented!()` bodies, error
    variants, options, constants from §3.4-3 backfilled. The crate compiles end-to-end but no method
    produces real output.
@@ -506,18 +517,21 @@ impl AudioEncoder {
     pub fn from_file<P: AsRef<Path>>(onnx_path: P, opts: Options) -> Result<Self>;
     pub fn from_memory(onnx_bytes: &[u8], opts: Options) -> Result<Self>;  // bytes copied
 
-    /// Wraps a pre-built ORT session. The session must conform to the input
-    /// and output schema in tests/fixtures/golden_onnx_io.json — name and
-    /// dtype are checked at construction; mismatches return Error::SessionSchema.
+    /// Wraps a pre-built ORT session. **In 0.1.0 this constructor is
+    /// primarily a thread-tuning escape hatch** — supply a Session built
+    /// with custom intra_op_threads or execution-provider settings.
+    /// Model-variant swapping requires regenerating the unit-norm const
+    /// and recompiling textclap (§3.4 step 4); a session loaded from a
+    /// fundamentally different ONNX bypasses the spec's pre-implementation
+    /// verification.
     ///
-    /// **`AUDIO_OUTPUT_IS_UNIT_NORM` is a compile-time const** baked in
-    /// during §3.4 step 4 from the static-inspection result. All three
-    /// AudioEncoder constructors (from_file / from_memory / from_ort_session)
-    /// use the same const — a wrapped Session inherits this value. Users
-    /// supplying a fundamentally different ONNX export via from_ort_session
-    /// must run §3.2 on it and regenerate the const before recompiling
-    /// textclap; otherwise the aggregation branch in embed_chunked will be
-    /// wrong for that artifact.
+    /// The session must conform to the input and output schema in
+    /// tests/fixtures/golden_onnx_io.json — name and dtype are checked at
+    /// construction; mismatches return Error::SessionSchema.
+    ///
+    /// `AUDIO_OUTPUT_IS_UNIT_NORM` is a compile-time const baked in during
+    /// §3.4 step 4. All three AudioEncoder constructors (from_file /
+    /// from_memory / from_ort_session) use the same const.
     pub fn from_ort_session(session: ort::session::Session, opts: Options) -> Result<Self>;
 
     /// Single clip, length 0 < len ≤ 480_000 samples (10 s @ 48 kHz):
@@ -687,22 +701,27 @@ impl Embedding {
     ///
     /// **Budget rationale.** Arrow IPC and Parquet for f32 are byte-exact —
     /// no quantization or recomputation in transit. The realistic
-    /// in-scope drift source is **summation-order divergence**: the writer
-    /// (e.g. NumPy column-major) computes `‖x‖` in one summation order,
-    /// the reader (Rust row-by-row) might verify in another. Both are
-    /// "correct" L2 normalizations to fp32, but they differ at the ULP
-    /// level. 5e-5 absorbs that; it is NOT a cross-platform reproducibility
-    /// check (use is_close_cosine for that). Truncation is caught earlier
-    /// by EmbeddingDimMismatch; fp16 storage round-trip is OUT OF SCOPE
-    /// (fp16's ulp(1.0) ≈ 9.77e-4 makes the check fail; users converting
-    /// through fp16 should use from_slice_normalizing). Tighten to 5e-7
-    /// (~4 ULP at norm² = 1) if real-world measurement supports it and
-    /// rejecting reordered-reduction goldens is acceptable.
+    /// in-scope drift source is **summation-order divergence**: NumPy's
+    /// `np.linalg.norm` calls BLAS `snrm2` (which may use pairwise or
+    /// scaled-sum algorithms), while Rust's `‖x‖` is typically a sequential
+    /// fma loop over 512 components. Both are "correct" L2 normalizations
+    /// to fp32, but they can disagree by up to ~512·ulp(1) ≈ 6.1e-5 in
+    /// the worst case. The 5e-5 budget is **typical-case**; if first-run
+    /// measurement on real data hits the worst case, widen to 1e-4. This
+    /// is NOT a cross-platform reproducibility check (use is_close_cosine
+    /// for that). Truncation is caught earlier by EmbeddingDimMismatch;
+    /// fp16 storage round-trip is OUT OF SCOPE (fp16's ulp(1.0) ≈ 9.77e-4
+    /// makes the check fail; users converting through fp16 should use
+    /// from_slice_normalizing).
     pub fn try_from_unit_slice(s: &[f32]) -> Result<Self>;
 
     /// Construct from any non-zero slice; always re-normalizes to unit length
-    /// (idempotent for input that's already unit-norm). Validates length and
-    /// rejects all-zero input via Error::EmbeddingZero.
+    /// (idempotent for input that's already unit-norm). Validates length,
+    /// rejects all-zero input via Error::EmbeddingZero, and rejects any
+    /// non-finite component (NaN, ±Inf) via Error::NonFiniteEmbedding.
+    /// The audio path catches non-finite samples earlier via
+    /// Error::NonFiniteAudio; this is the safety net for direct-construction
+    /// paths (e.g. read-back from a corrupt lancedb cell).
     pub fn from_slice_normalizing(s: &[f32]) -> Result<Self>;
 
     // Similarity (== for unit vectors, modulo fp32 ULP).
@@ -710,14 +729,19 @@ impl Embedding {
     pub fn cosine(&self, other: &Embedding) -> f32;
 
     /// Approximate equality test — raw float drift, max-abs metric.
+    /// Returns true if `(self − other).max_abs() ≤ tol` (note the
+    /// inclusive ≤ — this is a deliberate choice so that
+    /// `a.is_close(&a, 0.0)` always returns true, which matches how
+    /// users write self-equality tests).
     /// Use for tests checking implementation determinism.
     /// Recommended tolerance values: §12.2 reference table.
     pub fn is_close(&self, other: &Embedding, tol: f32) -> bool;
 
     /// Approximate equality test — semantic (cosine) metric.
-    /// Returns true if `1 − self.cosine(other) < tol`.
+    /// Returns true if `1 − self.cosine(other) ≤ tol` (inclusive ≤
+    /// for the same self-equality reason).
     ///
-    /// **Implementation.** Computed as `0.5 · ‖self − other‖₂² < tol` for
+    /// **Implementation.** Computed as `0.5 · ‖self − other‖₂² ≤ tol` for
     /// numerical stability — the algebraically-equivalent `1 − dot(a,b)`
     /// suffers catastrophic cancellation in fp32 for very-close vectors,
     /// which matters for the text row of §12.2 (tol ~5e-8). The identity
@@ -909,11 +933,18 @@ non-empty batch and writes raw model outputs into a caller-provided buffer. **Co
 ```rust
 /// Compute raw projections (un-normalized if §3.2 said the ONNX output is
 /// not internally L2-normalized; unit-norm if it is). Caller is responsible
-/// for any subsequent L2 normalization (skipped if the
-/// AUDIO_OUTPUT_IS_UNIT_NORM compile-time const is true).
+/// for any subsequent L2 normalization or release-mode unit-norm guard
+/// (the trust-path branch on the AUDIO_OUTPUT_IS_UNIT_NORM compile-time
+/// const lives in the public methods, not here).
 ///
 /// `out` is cleared on entry; capacity is reserved for clips.len() entries
-/// and one row is pushed per clip. Prior contents are dropped.
+/// and one row is pushed per clip. Prior contents are dropped — this is the
+/// *clear-and-fill* contract, not *append*.
+///
+/// The chunked path's per-call accumulator (the Vec<[f32; 512]> that
+/// gathers all chunks before aggregation) is a *separate* Vec from the
+/// encoder-owned proj_scratch the helper writes into; the chunked path
+/// copies from proj_scratch into the accumulator after each batch group.
 pub(crate) fn embed_projections_batched(
     &mut self,
     clips: &[&[f32]],         // 1..=N clips, each 1..=480_000 samples
@@ -974,16 +1005,23 @@ for i in 0..n {
 3. **Finiteness scan:** SIMD pass over `samples` for the first non-finite value. On hit:
    `Error::NonFiniteAudio { clip_index: None, sample_index }`.
 4. Call `embed_projections_batched(&[samples], &mut self.proj_scratch)`.
-5. Take `self.proj_scratch[0]`; if the `AUDIO_OUTPUT_IS_UNIT_NORM` const (§7.1, backfilled by §3.4 step 4
-   from `golden_onnx_io.json`) is `true`, construct via the trusted path with `debug_assert!` unit-norm;
-   otherwise L2-normalize and wrap as `Embedding`.
+5. Take `self.proj_scratch[0]`. If the `AUDIO_OUTPUT_IS_UNIT_NORM` const (§7.1, backfilled by §3.4
+   step 4 from `golden_onnx_io.json`) is `true`, construct via the trusted path **with a release-mode
+   unit-norm guard**: compute `(‖x‖² − 1).abs()` and return `Error::EmbeddingNotUnitNorm` if it exceeds
+   the same 5e-5 budget that `try_from_unit_slice` uses. The guard is ~512 fma + 1 sub + 1 cmp ≈ 200 ns,
+   negligible against ~50 ms ONNX inference. It catches the silent-corruption failure mode where a
+   wrongly-baked const (e.g. user supplied a different ONNX without rerunning §3.2) would otherwise
+   ship invalid Embeddings to lancedb that user `try_from_unit_slice` would later reject on every
+   read-back. Otherwise (`AUDIO_OUTPUT_IS_UNIT_NORM == false`) L2-normalize and wrap as `Embedding`.
 
 **`embed_batch(clips)`:**
 1. Empty slice → `Ok(Vec::new())`.
 2. For each clip `i`: empty → `Error::EmptyAudio { clip_index: Some(i) }`; too-long → `AudioTooLong`;
    finiteness scan → `Error::NonFiniteAudio { clip_index: Some(i), sample_index }`.
 3. Call `embed_projections_batched(clips, &mut self.proj_scratch)`.
-4. Row-by-row L2-normalize → `Vec<Embedding>`.
+4. Row-by-row construct `Embedding`s — same branch as single-clip `embed`: if `AUDIO_OUTPUT_IS_UNIT_NORM`
+   is `true`, use the trusted path with the release-mode unit-norm guard described below; otherwise
+   L2-normalize each row.
 
 **`embed_chunked(samples, opts)`:**
 1. `samples.is_empty()` → `Error::EmptyAudio { clip_index: None }`.
@@ -1056,7 +1094,8 @@ const TEXT_OUTPUT_NAME:         &str = "text_embeds";    // example; verify via 
 5. Bind tensor views via `TensorRef::from_array_view(([1usize, t], ids.as_slice()))?` for each input
    tensor; run; validate output shape `[1, 512]` via the §7.3.1 helper; copy out; drop views.
 6. If `TEXT_OUTPUT_IS_UNIT_NORM` (§7.1, compile-time const) is `true`, construct via the trusted path
-   with `debug_assert!` unit-norm; otherwise L2-normalize → `Embedding`.
+   with the release-mode unit-norm guard (5e-5 budget; same rationale as the audio-side guard at
+   §8.2 step 5); otherwise L2-normalize → `Embedding`.
 
 **`embed_batch(texts)`:**
 1. Empty slice → `Ok(Vec::new())`.
@@ -1064,7 +1103,9 @@ const TEXT_OUTPUT_NAME:         &str = "text_embeds";    // example; verify via 
 3. `tokenizer.encode_batch(texts)` → all encodings already padded to `T_max` (BatchLongest applied per §9.1).
 4. Resize encoder-owned ids/mask scratch via clear/reserve/resize to `[N × T_max]`; copy in-place.
 5. Bind tensor views, run, validate output shape `[N, 512]`, copy out, drop views.
-6. Row-by-row L2-normalize → `Vec<Embedding>`.
+6. Row-by-row construct `Embedding`s — same branch as single-clip `embed`: if `TEXT_OUTPUT_IS_UNIT_NORM`
+   is `true`, use the trusted path with the release-mode unit-norm guard (same 5e-5 budget as the audio
+   side, same rationale); otherwise L2-normalize each row.
 
 ## 10. Error type
 
@@ -1146,6 +1187,13 @@ pub enum Error {
     #[error("embedding is the zero vector")]
     EmbeddingZero,
 
+    /// Slice passed to from_slice_normalizing contained a non-finite
+    /// component (NaN, +Inf, or -Inf). The audio path catches this earlier
+    /// via NonFiniteAudio; this variant is the user-facing safety net for
+    /// direct construction (e.g. read-back from a corrupt lancedb cell).
+    #[error("embedding contains non-finite component at index {index}")]
+    NonFiniteEmbedding { index: usize },
+
     #[error("embedding norm out of tolerance: |norm² − 1| = {norm_sq_deviation:.3e}")]
     EmbeddingNotUnitNorm { norm_sq_deviation: f32 },
 
@@ -1165,6 +1213,11 @@ boxed dyn), matching silero's sibling pattern. The path-carrying / memory-carryi
 `OnnxLoadFromFile` / `OnnxLoadFromMemory` for symmetry. Configuration-time errors (`NoPadToken`,
 `PaddingFixedRejected`) are separate top-level variants, matching sibling structure (silero's
 `InvalidChunkLength`, soundevents' `MissingRatedEventIndex`).
+
+**Note on `Onnx` (#[from]) vs `OnnxLoadFromFile` / `OnnxLoadFromMemory`:** load-time errors are mapped
+explicitly via `.map_err(|e| Error::OnnxLoadFromFile { path, source: e })?` so the path is captured.
+Runtime ORT errors during `session.run()` fall through `#[from] ort::Error` to the catch-all `Onnx`
+variant — no path context is meaningful at that point.
 
 `Tokenize` is for runtime tokenization failures during `embed` / `embed_batch` calls. `embed_batch`
 returns a single `Tokenize` error from the underlying `tokenizer.encode_batch` — per-text indexing into
@@ -1209,6 +1262,13 @@ real call. The script measures the actual post-tokenizer count via the `tokenize
 records the chosen string (and its measured token count) as `warmup_text` in `golden_params.json`. The
 algorithm is deterministic: smallest integer `k` such that `pangram * k` yields ≥80 BPE tokens. No hand
 iteration; reproducible across maintainers.
+
+**`warmup_text` drift caveat.** The script measures token count using its generation-time `tokenizers`
+Python package against the bundled `tokenizer.json`. If a downstream user supplies a non-default
+tokenizer.json or upgrades the Rust `tokenizers` crate beyond the pinned major, the runtime BPE count
+may differ from the recorded value. The ≥80 target is robust to small drift but degrades under large
+drift; warmup remains correct (still triggers ORT specialization) but token scratch may grow once on
+the first real call beyond the recorded threshold.
 
 Sizes scratch for batch size 1; the first batched call (e.g. an offline backfill via `embed_batch(N=32)`)
 still grows scratch once. Magnitude: audio mel scratch grows from ~250 KB (N=1) to ~8 MB (N=32 batch),
@@ -1282,8 +1342,14 @@ attribution responsibilities:
   - Builder methods round-trip through accessors for both `with_*` and `set_*`.
   - `Options::default() == Options::new()`.
 - **`Embedding`:**
-  - `from_slice_normalizing` always produces unit-norm output for non-zero input.
+  - `from_slice_normalizing` always produces unit-norm output for non-zero finite input.
   - `from_slice_normalizing` rejects all-zero input → `EmbeddingZero`.
+  - `from_slice_normalizing` rejects any non-finite component (NaN, +Inf, -Inf in any of the 512
+    positions) → `NonFiniteEmbedding`.
+  - **Trust-path release guard:** when `AUDIO_OUTPUT_IS_UNIT_NORM` is `true`, the audio encoder rejects
+    non-unit-norm projections with `EmbeddingNotUnitNorm` (~512 fma + 1 sub + 1 cmp at ~200 ns; the
+    same 5e-5 budget as `try_from_unit_slice`). Test exercises this by supplying a known
+    non-unit-norm tensor through a mocked session and asserting the error is raised.
   - `try_from_unit_slice` rejects wrong lengths (`EmbeddingDimMismatch`) and non-unit-norm input
     (`EmbeddingNotUnitNorm`) at the 5e-5 norm² budget.
   - `dot ≈ cosine` for unit inputs (within fp32 ULP).
@@ -1310,21 +1376,32 @@ attribution responsibilities:
     // the naive impl regressed in.
     assert!(!a.is_close_cosine(&b, 1.0e-12));
 
-    // Sanity: confirm the cancellation actually happened by computing the
-    // naive form by hand on the same inputs. Both ULP-level checks below
-    // hold on x86_64 / aarch64 with fp32 round-to-nearest-even.
+    // Sanity: 1.0 − dot(a, b) computed in fp32 is *exactly* 0.0 here because
+    // dot(a, b) = 1·1 + 0·1e-4 = 1.0 mathematically. The naive form returning
+    // 0 is the bug: it masks the true cosine distance 0.5·‖a − b‖² = 5e-9
+    // that the safe form recovers. (This assertion documents the cancellation;
+    // the discrimination is in the assert!(!...) above.)
     let naive: f32 = 1.0 - a.dot(&b);
     assert_eq!(naive, 0.0_f32);
     ```
 
     A regression to the naive implementation makes the `assert!(!...)` fail. ε = 1e-4 (not 1e-9 or 1e-3)
-    is the perturbation that actually exercises cancellation: 1e-9 underflows below fp32 representable
-    perturbation in `‖y‖²` for both paths; 1e-3 produces `‖y‖² = 1 + 1e-6 ≈ 8 ulps` which is fp32-representable,
-    so naive doesn't cancel.
+    is the right perturbation. **For ε = 1e-9:** the safe value `0.5·‖a − b‖² = 5e-19` is itself below
+    `tol = 1e-12`, so safe and naive both return `true` — no discrimination. **For ε = 1e-3:**
+    `‖y‖² = 1 + 1e-6 ≈ 8 ulps` is fp32-representable, normalization actually changes the vectors, and
+    naive returns the same ~5e-7 the safe form returns — also no discrimination.
   - `to_vec` and `as_slice` are byte-equal.
-  - **No `pub const DIM`** — compile-time test that `Embedding::DIM` doesn't resolve.
-  - **Custom `Debug` output** does not contain 512 floats.
-  - **No `PartialEq` derived** — compile-time test.
+  - **No `pub const DIM`** — `# compile_fail` doctest on `Embedding`'s rustdoc:
+    ```rust,compile_fail
+    let _ = textclap::Embedding::DIM;     // textclap intentionally exposes no DIM const
+    ```
+    Avoids pulling in `trybuild` as a dev-dep.
+  - **Custom `Debug` output** does not contain 512 floats — assert via `format!("{:?}", emb)`
+    contains `"head:"` and not `"0.0,"` repeated 512 times.
+  - **No `PartialEq` derived** — same `# compile_fail` doctest pattern:
+    ```rust,compile_fail
+    let _ = a == b;                       // Embedding does not implement PartialEq
+    ```
 
 ### 12.2 Integration test (`tests/clap_integration.rs`)
 
