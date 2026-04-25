@@ -1,6 +1,6 @@
 # textclap — CLAP Inference Library Design
 
-**Status:** Draft (revision 8 — pipeline correction: audio path is fixed 10 s windows, no VAD)
+**Status:** Draft (revision 9 — text encoder is query-time only, not part of indexing)
 **Date:** 2026-04-25
 **Target version:** 0.1.0
 
@@ -18,59 +18,72 @@ exports are expected to work (same I/O contract) but have not been measured. See
 
 ### 1.1 Pipeline and the role of CLAP within it
 
-The user-facing search experience is "find audio matching this text query." textclap's two encoders make
-this work via **two independent indexing paths** — both producing 512-dim embeddings in CLAP's shared
-audio/text space, both stored in lancedb, both searchable from a text query.
+textclap exposes two encoders that work as the **indexing** and **query** halves of an audio-search system.
+The model treats them as a contrastive pair — audio embeddings and text embeddings live in the same 512-dim
+space — but **they are used at different times in the pipeline, not as parallel indexing paths**.
+
+**Indexing path (write side, runs continuously while audio is captured):**
 
 ```text
-                                  ┌─ audio path (fixed 10 s windows of the source audio) ─┐
-                                  │   decoder → resample to 48 kHz → buffer 10 s          │
-                                  │       → AudioEncoder::embed → 512-dim embedding       │
-audio frames                      │                                                        │
-(native rate, e.g. 44.1/48 kHz) ──┤                                                        │
-                                  │                                                        │
-                                  ├─ text path (speech transcription via STT) ─────────────┤
-                                  │   decoder → resample to 16 kHz → silero VAD            │
-                                  │       → speech segments → Whisper STT → transcripts   │
-                                  │       → TextEncoder::embed → 512-dim embedding         │
-                                  └────────────────────────────────────────────────────────┘
-                                                          ↓
-                                                  lancedb / vector store
-                                                          ↑
-        (query) text → TextEncoder::embed → cosine similarity against either column
+audio frames (native rate, e.g. 44.1 / 48 kHz)
+  → decoder → resample to 48 kHz → buffer 10 s
+  → AudioEncoder::embed → 512-dim audio embedding
+  → lancedb.write { audio_embedding, ts_start, ts_end, ... }
 ```
 
-The two paths are **independent**. They share the source audio stream but otherwise don't interact — the
-audio encoder does *not* slice on speech segments; it processes **fixed 10-second windows of the entire
-stream**. The text encoder feeds on Whisper transcripts of speech segments only. A text query embedding can
-then search either column (or both) since they live in the same 512-dim CLAP space.
+The audio encoder runs every 10 s of input. There is no VAD — CLAP is a general-audio model trained on
+AudioSet (speech, music, ambient sounds, alarms, animals, traffic, all of it), so the right input is the
+whole audio stream chunked at the model's training window. Pre-segmenting to "speech only" or "non-silence"
+would discard exactly the non-speech context CLAP excels at recognizing.
 
-**Why fixed 10-second windows on the audio side, no VAD.** CLAP is a general-audio model trained on
-AudioSet — it captures speech, music, ambient sounds, environmental noise, alarms, animals, traffic, all of
-it. The right input is the whole audio stream chunked into windows the model was trained on (10 s).
-Pre-segmenting to "speech only" or "non-silence" would discard exactly the non-speech context CLAP excels
-at recognizing. The decoder hands textclap a 10 s buffer of 48 kHz mono `f32` PCM; textclap embeds it; the
-caller does this every 10 s of input.
+**Query path (read side, on demand when a user submits a search):**
 
-**Sample-rate handling is the caller's problem.** silero requires 16 kHz mono; CLAP requires 48 kHz mono.
-textclap does not resample. The decoder typically resamples each branch independently from the native
-source rate. Both branches consume the same underlying audio, just at different sample rates.
+```text
+user query text (e.g. "dog barking near a door")
+  → TextEncoder::embed → 512-dim text embedding
+  → lancedb cosine-similarity search against the audio_embedding column
+  → ranked audio windows
+```
 
-`examples/audio_window_to_clap.rs` demonstrates the audio path (decoder → 48 kHz resample → 10 s window →
-embed). The STT branch is left out of 0.1.0 examples to avoid pulling Whisper as a dev-dep; it is documented
-in the README and a `stt_to_clap_text.rs` example is a §14 follow-up.
+The text encoder runs **once per search query**. It does *not* sit in the indexing path; it does *not*
+embed Whisper transcripts or any STT output. Its sole job is to convert a free-form text query into a vector
+in the same 512-dim space as the indexed audio embeddings, so cosine similarity finds matching audio.
+
+**Out of textclap's scope (but worth flagging because it's adjacent to a real deployment).** A user pipeline
+may run silero VAD + Whisper STT on the same source audio to produce transcripts and store them in a
+*separate* lancedb column for caption display, BM25 / FTS keyword search, or other text-based recall. That
+branch runs in parallel with textclap and does **not** route through CLAP's text encoder. It needs nothing
+from textclap.
+
+**Sample-rate handling is the caller's problem.** CLAP requires 48 kHz mono `f32` PCM; the decoder
+resamples to that. textclap does not resample. The 16 kHz path that silero needs is independent and runs
+out-of-band if the user pipeline does any STT.
+
+**Asymmetric encoder lifetime in deployment.** Because the audio encoder runs once per 10 s of input and
+the text encoder runs once per user search, indexing workers and query workers face very different load
+profiles. The API already supports loading only one encoder per process — `AudioEncoder::from_files(...)`
+and `TextEncoder::from_files(...)` are independent. An indexing-worker process can save the 121 MB text-model
+load by skipping `Clap::from_files` and constructing only `AudioEncoder`; a low-rate query process can
+similarly skip the audio model. Use `Clap::from_files` only when one process needs both. README documents
+the deployment pattern.
+
+`examples/audio_window_to_clap.rs` demonstrates the indexing path (decoder → 48 kHz resample → 10 s buffer
+→ `AudioEncoder::embed` → stubbed lancedb write). `examples/index_and_search.rs` shows the read side
+(text query → `TextEncoder::embed` → stubbed lancedb search) plus the indexing side at a glance.
 
 ### 1.2 What CLAP recognizes — and doesn't
 
 **Domain-of-training.** CLAP-HTSAT-unfused was trained on AudioSet plus general-audio captions: it
 discriminates speech-vs-music-vs-ambient, recognizes specific sound categories (dog barks, alarms, traffic,
-machinery, water, applause), and tracks coarse acoustic scene attributes. **It does not discriminate within
-speech** — different conversations cluster together in CLAP-audio space because their acoustic features
-(speech-band energy, voiced/unvoiced patterns, prosody) are similar regardless of content.
+machinery, water, applause), and tracks coarse acoustic scene attributes. It is suited to descriptive text
+queries like *"rain on a metal roof,"* *"applause in a stadium,"* *"engine starting,"* *"speech with a
+loud crowd in the background."*
 
-For "what was said" queries, the **text branch via STT** does the work (transcripts → text encoder). For
-"what kind of sound is this" queries, the **audio branch** does. A pipeline using both indexes both kinds
-of recall in the same vector space.
+**It is NOT suited to within-speech content queries** like *"the meeting where Alice mentioned Q3
+revenue."* Conversations cluster tightly in CLAP-audio space because their acoustic features (speech-band
+energy, voiced/unvoiced patterns, prosody) are similar regardless of what was said. For that kind of recall,
+the user's pipeline indexes Whisper transcripts as plain text in a separate column (BM25 / FTS / vector search
+with a separate text model); textclap is not involved.
 
 **Short-clip artifacts (off the recommended path).** If callers feed `embed()` with clips shorter than 10 s
 — e.g. per-VAD-segment for a different use case — textclap's repeat-pad fills the window by tiling, which
@@ -1162,10 +1175,12 @@ textclap is currently the bare `al8n/template-rs` scaffold.
   warning that `tokenizer.json` must come from the same Xenova export (not from
   `laion/clap-htsat-unfused` directly), model-attribution-on-downstream section (§11.6), ort-coupling note,
   license, lancedb integration snippet, deployment note that thread-per-core means each worker calls
-  `from_files` **sequentially at startup** with **150–300 MB resident per worker**, **the §1.1 two-path
-  pipeline diagram** (audio = fixed 10 s windows, text = silero VAD → STT branch — independent paths into
-  the same lancedb), §1.2 domain-of-training and short-clip caveats, thread-tuning note pointing users to
-  `from_ort_session` for thread/EP configuration.
+  `from_files` **sequentially at startup** with **150–300 MB resident per worker** (or use the
+  single-encoder constructors `AudioEncoder::from_files` / `TextEncoder::from_files` to load only one
+  side per process — see the deployment-pattern guidance in §1.1), **the §1.1 indexing-vs-query pipeline
+  diagram** (audio encoder runs at indexing time on fixed 10 s windows; text encoder runs at query time
+  on user search text only; STT/transcripts are out of textclap's scope), §1.2 domain-of-training and
+  short-clip caveats, thread-tuning note pointing users to `from_ort_session` for thread/EP configuration.
 - `src/lib.rs` (keep crate-level lints; replace body with module decls and the explicit re-exports listed
   in §4).
 - `tests/foo.rs` → delete.
@@ -1183,11 +1198,14 @@ textclap is currently the bare `al8n/template-rs` scaffold.
 - `src/error.rs`, `src/options.rs`, `src/mel.rs`, `src/audio.rs`, `src/text.rs`, `src/clap.rs`.
 - `tests/fixtures/` contents per §3 / §12.2 (including `README.md` for sample.wav provenance and `MODELS.md`
   for model SHA256s).
-- `examples/index_and_search.rs` — pipeline shape, lancedb stubbed.
-- `examples/audio_window_to_clap.rs` — the §1.1 audio path: source frames at native rate (the example uses
-  44.1 kHz) → `rubato` resample to 48 kHz → buffer 10 s of samples → `AudioEncoder::embed` → 512-dim
-  `Embedding` → push to a stubbed lancedb writer. No VAD; no per-segment slicing. Demonstrates the
-  fixed-window flow that's the recommended deployment.
+- `examples/index_and_search.rs` — both halves at a glance: an indexing loop (audio frames →
+  `AudioEncoder::embed` → stubbed `lancedb.write`) followed by a query (`"dog barking near a door"` →
+  `TextEncoder::embed` → stubbed `lancedb.search`). Shows the asymmetric encoder lifetime — indexing runs
+  many times per minute, query runs on demand.
+- `examples/audio_window_to_clap.rs` — the §1.1 indexing path in isolation: source frames at native rate
+  (the example uses 44.1 kHz) → `rubato` resample to 48 kHz → buffer 10 s of samples →
+  `AudioEncoder::embed` → 512-dim `Embedding` → push to a stubbed lancedb writer. No VAD; no per-segment
+  slicing.
 - This spec under `docs/superpowers/specs/`.
 
 ### lancedb integration snippet (for README)
@@ -1196,20 +1214,22 @@ textclap is currently the bare `al8n/template-rs` scaffold.
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
 use textclap::Embedding;
 
-// Ingest (clap is owned mutably by this worker thread):
-let embedding: Embedding = clap.audio_mut().embed(&pcm_48khz_mono)?;
+// ── Indexing side: every 10 s of buffered 48 kHz mono audio ──
+let embedding: Embedding = clap.audio_mut().embed(&pcm_48khz_mono_10s)?;
 let dim = embedding.as_slice().len() as i32;          // dimension-agnostic
 let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dim);
 builder.values().append_slice(embedding.as_slice()); // copies into Arrow's MutableBuffer
 builder.append(true);
+// (build a record batch with this column + timestamps + metadata → table.add(...))
 
-// Query: lancedb takes Vec<f32>
+// ── Query side: when a user submits a text search ──
+// The text encoder runs ONCE per query, not per indexed item.
 let query: Embedding = clap.text_mut().embed("dog barking near a door")?;
 let _ = table.search(query.to_vec()).limit(10).execute().await?;
 
-// Read-back (rare; lancedb usually computes similarity for you):
-let raw: Vec<f32> = row.get("embedding")?;
-let stored = Embedding::try_from_unit_slice(&raw)?;     // validates len AND norm
+// ── Read-back (rare; lancedb usually computes similarity for you) ──
+let raw: Vec<f32> = row.get("audio_embedding")?;
+let stored = Embedding::try_from_unit_slice(&raw)?;   // validates len AND norm
 let sim = query.cosine(&stored);
 ```
 
@@ -1228,10 +1248,6 @@ let sim = query.cosine(&stored);
 - An optional **strict LAION-reference mode** for `embed_chunked` — single-window rand_trunc with a
   caller-provided RNG seed.
 - A doctest on `Embedding::cosine` showing the lancedb round-trip specifically.
-- An `examples/stt_to_clap_text.rs` example showing the §1.1 text branch: source frames → 16 kHz resample
-  → silero VAD → speech segments (`mediatime::TimeRange`) → Whisper STT → transcripts → `TextEncoder::embed`
-  → `Embedding`. Held out of 0.1.0 because it pulls Whisper as a dev-dep and the STT integration is
-  separately involved enough that it deserves its own example with its own choices.
 - `tracing` feature for service-tier observability.
 - `try_reserve_exact` on scratch resizes to surface OOM as `Error::ScratchAlloc` instead of panic.
 - `Options::with_truncation_warn_threshold(usize)` to log when text inputs hit the silent truncation cap.
