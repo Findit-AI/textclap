@@ -1,6 +1,6 @@
 # textclap — CLAP Inference Library Design
 
-**Status:** Draft (revision 13, post-rev-12 review)
+**Status:** Draft (revision 14, post-rev-13 review)
 **Date:** 2026-04-25
 **Target version:** 0.1.0
 
@@ -517,21 +517,25 @@ impl AudioEncoder {
     pub fn from_file<P: AsRef<Path>>(onnx_path: P, opts: Options) -> Result<Self>;
     pub fn from_memory(onnx_bytes: &[u8], opts: Options) -> Result<Self>;  // bytes copied
 
-    /// Wraps a pre-built ORT session. **In 0.1.0 this constructor is
-    /// primarily a thread-tuning escape hatch** — supply a Session built
-    /// with custom intra_op_threads or execution-provider settings.
-    /// Model-variant swapping requires regenerating the unit-norm const
-    /// and recompiling textclap (§3.4 step 4); a session loaded from a
-    /// fundamentally different ONNX bypasses the spec's pre-implementation
-    /// verification.
+    /// Wraps a pre-built ORT session.
     ///
-    /// The session must conform to the input and output schema in
-    /// tests/fixtures/golden_onnx_io.json — name and dtype are checked at
-    /// construction; mismatches return Error::SessionSchema.
+    /// **Two distinct purposes:**
+    /// (a) **Thread tuning / EP selection (supported).** Supply a Session
+    ///     built with custom `intra_op_threads`, `inter_op_threads`, or a
+    ///     different execution provider (CUDA, CoreML). The wrapped
+    ///     session must still match the ONNX schema in
+    ///     `golden_onnx_io.json` — name and dtype are checked at
+    ///     construction; mismatches return `Error::SessionSchema`.
+    /// (b) **Model-variant swapping (NOT directly supported).** Supplying
+    ///     a different ONNX export (e.g., fp16 instead of int8) requires
+    ///     regenerating the `AUDIO_OUTPUT_IS_UNIT_NORM` const via §3.2
+    ///     and recompiling textclap. The schema check is necessary but
+    ///     NOT sufficient: a wrongly-baked const causes silent corruption
+    ///     of stored embeddings (the §8.2 trust-path release-mode guard
+    ///     catches this at write-time, returning `EmbeddingNotUnitNorm`).
     ///
     /// `AUDIO_OUTPUT_IS_UNIT_NORM` is a compile-time const baked in during
-    /// §3.4 step 4. All three AudioEncoder constructors (from_file /
-    /// from_memory / from_ort_session) use the same const.
+    /// §3.4 step 4. All three AudioEncoder constructors share the same const.
     pub fn from_ort_session(session: ort::session::Session, opts: Options) -> Result<Self>;
 
     /// Single clip, length 0 < len ≤ 480_000 samples (10 s @ 48 kHz):
@@ -697,7 +701,8 @@ impl Embedding {
     pub fn to_vec(&self) -> Vec<f32>;
 
     /// Reconstruct from a stored unit vector. Validates length AND norm
-    /// (release-mode check: `(norm² − 1).abs() < 5e-5`).
+    /// (release-mode check: `(norm² − 1).abs() ≤ NORM_BUDGET`, where
+    /// NORM_BUDGET = 1e-4 — see below).
     ///
     /// **Budget rationale.** Arrow IPC and Parquet for f32 are byte-exact —
     /// no quantization or recomputation in transit. The realistic
@@ -705,14 +710,24 @@ impl Embedding {
     /// `np.linalg.norm` calls BLAS `snrm2` (which may use pairwise or
     /// scaled-sum algorithms), while Rust's `‖x‖` is typically a sequential
     /// fma loop over 512 components. Both are "correct" L2 normalizations
-    /// to fp32, but they can disagree by up to ~512·ulp(1) ≈ 6.1e-5 in
-    /// the worst case. The 5e-5 budget is **typical-case**; if first-run
-    /// measurement on real data hits the worst case, widen to 1e-4. This
-    /// is NOT a cross-platform reproducibility check (use is_close_cosine
-    /// for that). Truncation is caught earlier by EmbeddingDimMismatch;
-    /// fp16 storage round-trip is OUT OF SCOPE (fp16's ulp(1.0) ≈ 9.77e-4
-    /// makes the check fail; users converting through fp16 should use
-    /// from_slice_normalizing).
+    /// to fp32, but they can disagree by up to ~512·ulp(1) ≈ 6.1e-5 in the
+    /// worst case. **The budget ships at 1e-4** — comfortably above the
+    /// worst-case bound, with margin for the BLAS-implementation variation
+    /// a maintainer might hit when regenerating goldens on a different
+    /// runtime (glibc snrm2 vs MKL vs OpenBLAS vs Apple Accelerate). 1e-4
+    /// still rejects truncation (10× wrong norm² is ~1.0 deviation),
+    /// byte corruption (drift ≫ 1e-4), and fp16 storage round-trip
+    /// (~2e-3) by orders of magnitude — the actual bug classes the budget
+    /// is meant to catch. Tighten to 5e-5 in a future minor release if
+    /// real-run measurement supports it; rolling back is a low-stakes
+    /// spec edit, while rolling forward from a 5e-5 production failure
+    /// would be a higher-stakes patch.
+    ///
+    /// This is NOT a cross-platform reproducibility check (use
+    /// is_close_cosine for that). Truncation is caught earlier by
+    /// EmbeddingDimMismatch; fp16 storage round-trip is OUT OF SCOPE
+    /// (fp16's ulp(1.0) ≈ 9.77e-4 makes the check fail; users converting
+    /// through fp16 should use from_slice_normalizing).
     pub fn try_from_unit_slice(s: &[f32]) -> Result<Self>;
 
     /// Construct from any non-zero slice; always re-normalizes to unit length
@@ -722,6 +737,11 @@ impl Embedding {
     /// The audio path catches non-finite samples earlier via
     /// Error::NonFiniteAudio; this is the safety net for direct-construction
     /// paths (e.g. read-back from a corrupt lancedb cell).
+    ///
+    /// **Cost.** ~100 ns over 512 components (finiteness scan + L2 norm).
+    /// For bulk hot-path import where upstream guarantees finiteness and
+    /// unit-norm, prefer `try_from_unit_slice` (skips the renormalization
+    /// pass; just validates length and norm).
     pub fn from_slice_normalizing(s: &[f32]) -> Result<Self>;
 
     // Similarity (== for unit vectors, modulo fp32 ULP).
@@ -931,11 +951,12 @@ non-empty batch and writes raw model outputs into a caller-provided buffer. **Co
 `out` are dropped — the function clears and resizes the buffer to `clips.len()` before writing.**
 
 ```rust
-/// Compute raw projections (un-normalized if §3.2 said the ONNX output is
-/// not internally L2-normalized; unit-norm if it is). Caller is responsible
-/// for any subsequent L2 normalization or release-mode unit-norm guard
-/// (the trust-path branch on the AUDIO_OUTPUT_IS_UNIT_NORM compile-time
-/// const lives in the public methods, not here).
+/// Compute the audio model's raw projection outputs. These are
+/// un-normalized 512-dim vectors if AUDIO_OUTPUT_IS_UNIT_NORM is false,
+/// or already-unit-norm vectors if it is true. Callers (the public
+/// embed*/embed_batch/embed_chunked methods) handle any subsequent
+/// L2 normalization or release-mode unit-norm guard themselves —
+/// the trust-path branch lives in the public methods, not here.
 ///
 /// `out` is cleared on entry; capacity is reserved for clips.len() entries
 /// and one row is pushed per clip. Prior contents are dropped — this is the
@@ -945,6 +966,11 @@ non-empty batch and writes raw model outputs into a caller-provided buffer. **Co
 /// gathers all chunks before aggregation) is a *separate* Vec from the
 /// encoder-owned proj_scratch the helper writes into; the chunked path
 /// copies from proj_scratch into the accumulator after each batch group.
+/// The accumulator is freshly heap-allocated on each embed_chunked call
+/// (~ceil(L/hop) · 2 KB; ~12 KB for 60 s of audio at the default hop).
+/// This is acceptable because embed_chunked is the offline single-clip
+/// summarization path (§1.2), not the live indexing hot path — the live
+/// path uses embed and the encoder-owned proj_scratch directly.
 pub(crate) fn embed_projections_batched(
     &mut self,
     clips: &[&[f32]],         // 1..=N clips, each 1..=480_000 samples
@@ -1007,12 +1033,23 @@ for i in 0..n {
 4. Call `embed_projections_batched(&[samples], &mut self.proj_scratch)`.
 5. Take `self.proj_scratch[0]`. If the `AUDIO_OUTPUT_IS_UNIT_NORM` const (§7.1, backfilled by §3.4
    step 4 from `golden_onnx_io.json`) is `true`, construct via the trusted path **with a release-mode
-   unit-norm guard**: compute `(‖x‖² − 1).abs()` and return `Error::EmbeddingNotUnitNorm` if it exceeds
-   the same 5e-5 budget that `try_from_unit_slice` uses. The guard is ~512 fma + 1 sub + 1 cmp ≈ 200 ns,
-   negligible against ~50 ms ONNX inference. It catches the silent-corruption failure mode where a
-   wrongly-baked const (e.g. user supplied a different ONNX without rerunning §3.2) would otherwise
-   ship invalid Embeddings to lancedb that user `try_from_unit_slice` would later reject on every
-   read-back. Otherwise (`AUDIO_OUTPUT_IS_UNIT_NORM == false`) L2-normalize and wrap as `Embedding`.
+   unit-norm guard**: compute `(‖x‖² − 1).abs()` and return `Error::EmbeddingNotUnitNorm` if it
+   exceeds `NORM_BUDGET` (the same 1e-4 budget `try_from_unit_slice` uses; defined once as
+   `pub(crate) const NORM_BUDGET: f32 = 1e-4` in `embedding.rs` and referenced from all four
+   call sites). The guard is ~512 fma + 1 sub + 1 cmp ≈ 200 ns, negligible against ~50 ms ONNX
+   inference. It catches the silent-corruption failure mode where a wrongly-baked const (e.g. user
+   supplied a different ONNX without rerunning §3.2) would otherwise ship invalid Embeddings to
+   lancedb that user `try_from_unit_slice` would later reject on every read-back. Otherwise
+   (`AUDIO_OUTPUT_IS_UNIT_NORM == false`) L2-normalize and wrap as `Embedding`.
+
+   **Why 1e-4 and not 1e-6 here.** The realistic failure mode is "wrongly-baked const" — a user
+   supplied a different ONNX export through `from_ort_session` without rerunning §3.2. In that
+   case the model output is not unit-norm at all (norm² is ≫ 1 if the L2-normalize op was
+   absent, or some arbitrary value if a different model entirely). 1e-4 catches all such cases by
+   many orders of magnitude. A tighter ~1e-6 guard would be defense-in-depth against a
+   *hypothetical* buggy ORT normalize op producing 1.000005-ish norms — a class that does not
+   exist in the verified Xenova export. Naming consistency with `try_from_unit_slice`
+   (NORM_BUDGET) wins over speculative tightening.
 
 **`embed_batch(clips)`:**
 1. Empty slice → `Ok(Vec::new())`.
@@ -1041,7 +1078,8 @@ for i in 0..n {
 **Allocation budget per call (after warmup):**
 - `embed`: only the output `Embedding`.
 - `embed_batch(N)`: `Vec<Embedding>` of N entries; mel scratch grows once per new max size.
-- `embed_chunked(L, batch=B)`: per-call `Vec<[f32; 512]>` of `ceil(L / hop)` entries.
+- `embed_chunked(L, batch=B)`: per-call `Vec<[f32; 512]>` of *up to* `ceil(L / hop)` entries (trailing
+  partial chunks shorter than `window/4` are skipped per §7.8).
 
 `warmup()` runs a single `embed` (480 000 samples of silence) which sizes steady-state scratch and triggers
 ORT operator specialization.
@@ -1094,8 +1132,8 @@ const TEXT_OUTPUT_NAME:         &str = "text_embeds";    // example; verify via 
 5. Bind tensor views via `TensorRef::from_array_view(([1usize, t], ids.as_slice()))?` for each input
    tensor; run; validate output shape `[1, 512]` via the §7.3.1 helper; copy out; drop views.
 6. If `TEXT_OUTPUT_IS_UNIT_NORM` (§7.1, compile-time const) is `true`, construct via the trusted path
-   with the release-mode unit-norm guard (5e-5 budget; same rationale as the audio-side guard at
-   §8.2 step 5); otherwise L2-normalize → `Embedding`.
+   with the release-mode unit-norm guard (`NORM_BUDGET = 1e-4`; same rationale as the audio-side guard
+   at §8.2 step 5); otherwise L2-normalize → `Embedding`.
 
 **`embed_batch(texts)`:**
 1. Empty slice → `Ok(Vec::new())`.
@@ -1104,8 +1142,8 @@ const TEXT_OUTPUT_NAME:         &str = "text_embeds";    // example; verify via 
 4. Resize encoder-owned ids/mask scratch via clear/reserve/resize to `[N × T_max]`; copy in-place.
 5. Bind tensor views, run, validate output shape `[N, 512]`, copy out, drop views.
 6. Row-by-row construct `Embedding`s — same branch as single-clip `embed`: if `TEXT_OUTPUT_IS_UNIT_NORM`
-   is `true`, use the trusted path with the release-mode unit-norm guard (same 5e-5 budget as the audio
-   side, same rationale); otherwise L2-normalize each row.
+   is `true`, use the trusted path with the release-mode unit-norm guard (`NORM_BUDGET`, same rationale
+   as the audio side); otherwise L2-normalize each row.
 
 ## 10. Error type
 
@@ -1191,8 +1229,11 @@ pub enum Error {
     /// component (NaN, +Inf, or -Inf). The audio path catches this earlier
     /// via NonFiniteAudio; this variant is the user-facing safety net for
     /// direct construction (e.g. read-back from a corrupt lancedb cell).
-    #[error("embedding contains non-finite component at index {index}")]
-    NonFiniteEmbedding { index: usize },
+    /// Field name `component_index` matches the qualified-name convention
+    /// used by sibling variants (`clip_index`, `batch_index`, `sample_index`)
+    /// — minor stylistic divergence from soundevents' bare `index`.
+    #[error("embedding contains non-finite component at component_index {component_index}")]
+    NonFiniteEmbedding { component_index: usize },
 
     #[error("embedding norm out of tolerance: |norm² − 1| = {norm_sq_deviation:.3e}")]
     EmbeddingNotUnitNorm { norm_sq_deviation: f32 },
@@ -1347,11 +1388,11 @@ attribution responsibilities:
   - `from_slice_normalizing` rejects any non-finite component (NaN, +Inf, -Inf in any of the 512
     positions) → `NonFiniteEmbedding`.
   - **Trust-path release guard:** when `AUDIO_OUTPUT_IS_UNIT_NORM` is `true`, the audio encoder rejects
-    non-unit-norm projections with `EmbeddingNotUnitNorm` (~512 fma + 1 sub + 1 cmp at ~200 ns; the
-    same 5e-5 budget as `try_from_unit_slice`). Test exercises this by supplying a known
-    non-unit-norm tensor through a mocked session and asserting the error is raised.
+    non-unit-norm projections with `EmbeddingNotUnitNorm` (~512 fma + 1 sub + 1 cmp at ~200 ns; uses
+    the shared `NORM_BUDGET = 1e-4`). Test exercises this by supplying a known non-unit-norm tensor
+    through a mocked session and asserting the error is raised.
   - `try_from_unit_slice` rejects wrong lengths (`EmbeddingDimMismatch`) and non-unit-norm input
-    (`EmbeddingNotUnitNorm`) at the 5e-5 norm² budget.
+    (`EmbeddingNotUnitNorm`) at the shared `NORM_BUDGET = 1e-4`.
   - `dot ≈ cosine` for unit inputs (within fp32 ULP).
   - `is_close(&self, &self, 0.0)` returns true.
   - `is_close_cosine(&self, &self, 0.0)` returns true.
@@ -1388,8 +1429,12 @@ attribution responsibilities:
     A regression to the naive implementation makes the `assert!(!...)` fail. ε = 1e-4 (not 1e-9 or 1e-3)
     is the right perturbation. **For ε = 1e-9:** the safe value `0.5·‖a − b‖² = 5e-19` is itself below
     `tol = 1e-12`, so safe and naive both return `true` — no discrimination. **For ε = 1e-3:**
-    `‖y‖² = 1 + 1e-6 ≈ 8 ulps` is fp32-representable, normalization actually changes the vectors, and
-    naive returns the same ~5e-7 the safe form returns — also no discrimination.
+    `‖y‖² = 1 + 1e-6 ≈ 8 ulps` is fp32-representable, normalization genuinely changes the vectors, and
+    naive ≈ safe ≈ 5e-7 — also no discrimination.
+
+    **Test scope.** The test verifies cancellation safety only — any implementation that produces
+    `5e-9 ± a few fp32 ULP` for these inputs satisfies it. The squared-distance form is the canonical
+    fix; alternative correct implementations (e.g. an extended-precision intermediate) would also pass.
   - `to_vec` and `as_slice` are byte-equal.
   - **No `pub const DIM`** — `# compile_fail` doctest on `Embedding`'s rustdoc:
     ```rust,compile_fail
@@ -1441,9 +1486,10 @@ calibrated downward only after real-run measurement supports it. Per-OS budget t
 
 **Tolerance origin (text).** Integer token ids → no upstream drift; 1e-5 catches RoBERTa wiring bugs.
 
-**`try_from_unit_slice`'s norm² budget (5e-5)** is intentionally tighter than the audio-embedding budget —
-goldens are L2-normalized in the same float order Rust uses, and stored vectors that haven't crossed
-quantization or platform boundaries should round-trip exactly.
+**`try_from_unit_slice`'s norm² budget (`NORM_BUDGET = 1e-4`)** is comfortably above the worst-case
+~6.1e-5 BLAS-vs-sequential-sum drift derived in §7.5 — goldens are L2-normalized in the same float
+order Rust uses, but a maintainer regenerating goldens on a different BLAS runtime (MKL vs OpenBLAS
+vs Apple Accelerate) could plausibly approach the worst case. 1e-4 absorbs that with margin.
 
 **Discrimination check:** `classify_all` is run with the labels
 `["a dog barking", "rain", "music", "silence", "door creaking"]`. The test asserts:
@@ -1461,6 +1507,10 @@ Three Criterion benchmarks. Each `setup` closure calls `warmup()` before `iter`:
 - `bench_mel.rs` — `MelExtractor::extract_into` on a 10 s buffer.
 - `bench_audio_encode.rs` — full encode for batch sizes 1, 4, 8.
 - `bench_text_encode.rs` — text encode for batch sizes 1, 8, 32.
+
+The audio/text batched benches use `criterion::BenchmarkGroup` with one entry per batch size; each entry
+grows scratch on its first iteration (since `warmup()` only sizes for `N=1`). Criterion's per-group warmup
+phase absorbs this — the reported median reflects steady-state cost, not first-call growth.
 
 ### 12.5 CI
 
@@ -1587,3 +1637,7 @@ let sim = query.cosine(&stored);
   a `CancelHandle` type. Deferred — feature decision, not infeasibility.
 - An AddressSanitizer CI job — Miri can't cross the FFI boundary, but ASan does. Only worth adding if the
   §7.3.1 contract ever needs empirical re-validation beyond what the borrow checker enforces statically.
+- **fp16 storage round-trip support.** `try_from_unit_slice` is currently OUT OF SCOPE for fp16 storage
+  (fp16's ulp(1.0) ≈ 9.77e-4 exceeds the 1e-4 norm budget); users storing embeddings in fp16 columns must
+  use `from_slice_normalizing` on read-back. A future variant `try_from_unit_slice_fp16` (with a relaxed
+  ~5e-3 budget) would let users opt into "I know it came through fp16, don't normalize again" semantics.
