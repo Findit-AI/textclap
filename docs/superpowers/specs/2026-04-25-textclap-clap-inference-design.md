@@ -1,6 +1,6 @@
 # textclap — CLAP Inference Library Design
 
-**Status:** Draft (revision 10, post-rev-9 review)
+**Status:** Draft (revision 11, post-rev-10 review)
 **Date:** 2026-04-25
 **Target version:** 0.1.0
 
@@ -148,10 +148,12 @@ versions in a header comment):
      centering flag, and the pad mode all go into `golden_params.json`. mel.rs uses `T` from there.
    - `padding` mode, `truncation` mode (the latter intentionally diverges in Rust — see §8.1).
    - `frequency_min` / `frequency_max`.
-   - **Warmup token target.** The script tokenizes a candidate warmup string and reports its post-tokenizer
-     count. The maintainer iterates on the string until it lands at ≥80 BPE tokens (above CLAP's typical
-     `max_length=77`); the chosen string is recorded as `warmup_text` in `golden_params.json`. This is the
-     literal string `Clap::warmup` will use (§11.4).
+   - **Warmup token target.** The script generates the warmup string deterministically: starting from the
+     pangram `"the quick brown fox jumps over the lazy dog "`, repeat it the smallest integer `k` times
+     such that the post-tokenizer count is ≥80 BPE tokens (above CLAP's typical `max_length=77`). The
+     resulting `pangram * k` string is recorded as `warmup_text` in `golden_params.json` along with the
+     measured token count. This is reproducible across maintainers — no hand iteration. The literal
+     string is what `Clap::warmup` feeds to the text encoder (§11.4).
 3. Runs the extractor; saves resulting `[64, T]` mel features to `golden_mel.npy`.
 4. **Audio model golden.** Loads `audio_model_quantized.onnx` via `onnxruntime.InferenceSession`; runs it
    on the golden mel features. Computes the L2-normalized embedding using the *exact* formula
@@ -193,9 +195,15 @@ file the spec answers:
 script runs both transformations and picks the lower-error one:
 
 ```python
+import json
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+# Names recorded by the static-inspection pass earlier in this script.
+onnx_io = json.load(open("tests/fixtures/golden_onnx_io.json"))
+AUDIO_INPUT_NAME = onnx_io["audio_input_name"]      # e.g. "input_features"
+AUDIO_OUTPUT_NAME = onnx_io["audio_output_name"]    # e.g. "audio_embeds"
 
 # AudioSet stats per AST/HTSAT convention; computed in dB space (post-power_to_db).
 # Source: LAION CLAP repo / Xenova export config — confirm against the actual checkpoint.
@@ -217,7 +225,7 @@ pt_emb = F.normalize(pt_emb, dim=-1)                    # robust to any batch si
 results = {}
 for name, fn in [("none", lambda x: x), ("global_mean_std", apply_audioset_norm)]:
     ort_input = fn(features["input_features"].numpy()).astype(np.float32)
-    ort_raw = audio_session.run(None, {AUDIO_INPUT_NAME: ort_input})[0]
+    ort_raw = audio_session.run([AUDIO_OUTPUT_NAME], {AUDIO_INPUT_NAME: ort_input})[0]
     ort_emb = ort_raw / np.linalg.norm(ort_raw).astype(np.float32)
     drift = float(np.max(np.abs(pt_emb.numpy() - ort_emb)))
     results[name] = drift
@@ -228,7 +236,16 @@ for name, fn in [("none", lambda x: x), ("global_mean_std", apply_audioset_norm)
 #                  (simpler and auditable); warn in stdout
 #   ≥ 2e-2       → reject (both transforms); something else is wrong, investigate
 chosen, drift = min(results.items(), key=lambda kv: kv[1])
-record(htsat_input_normalization=chosen, htsat_norm_drift=drift)
+
+# Write to golden_params.json (read/modify/write by this script — see §3.1).
+golden_params = json.load(open("tests/fixtures/golden_params.json"))
+golden_params["htsat_input_normalization"] = {
+    "type": chosen,
+    "mean": AUDIOSET_MEAN if chosen == "global_mean_std" else None,
+    "std":  AUDIOSET_STD  if chosen == "global_mean_std" else None,
+}
+golden_params["htsat_norm_drift"] = drift
+json.dump(golden_params, open("tests/fixtures/golden_params.json", "w"), indent=2)
 ```
 
 The 5e-3 / 2e-2 thresholds are **heuristic**: calibrated against published int8 quantization drift estimates
@@ -261,8 +278,14 @@ the README.
 3. **Spec-update commit:** §8.1 mel parameter table, §8.2 / §9.2 tensor names and shapes, §7.4
    attention-mask / position_ids description, §11.4 warmup string, §12.2 tolerance table — all replaced
    with values consistent with the generated fixtures.
-4. **Rust `src/` implementation commits.** (`tests/clap_integration.rs` reads goldens and exists prior to
-   step 4; what step 4 is "before" is `src/` Rust.)
+4. **Rust src/ skeleton commit:** module structure, public types with `unimplemented!()` bodies, error
+   variants, options, constants from §3.4-3 backfilled. The crate compiles end-to-end but no method
+   produces real output.
+5. **`tests/clap_integration.rs` and `benches/` commits:** these reference public types from `src/`, so
+   the skeleton from step 4 must exist first.
+6. **Real `src/` implementation commits** replacing the `unimplemented!()` bodies — mel extractor first
+   (verified by §8.1.1 / §8.1.2 unit tests against the librosa fixtures), then audio encoder, then text
+   encoder, then `Clap` and the zero-shot helper.
 
 ## 4. Crate layout
 
@@ -280,8 +303,9 @@ textclap/
 │   ├── error.rs                     # Error enum (thiserror)
 │   ├── options.rs                   # Options, ChunkingOptions; re-exports GraphOptimizationLevel from ort
 │   ├── mel.rs                       # MelExtractor: STFT → mel filterbank → log-mel
-│   ├── audio.rs                     # AudioEncoder + AUDIO_OUTPUT_NAME constant
-│   ├── text.rs                      # TextEncoder + TEXT_OUTPUT_NAME constant
+│   ├── audio.rs                     # AudioEncoder + AUDIO_INPUT_NAME / AUDIO_OUTPUT_NAME consts (§8.2)
+│   ├── text.rs                      # TextEncoder + TEXT_INPUT_IDS_NAME / TEXT_ATTENTION_MASK_NAME /
+│   │                                # (optional) TEXT_POSITION_IDS_NAME / TEXT_OUTPUT_NAME consts (§9.2)
 │   └── clap.rs                      # Clap, Embedding, LabeledScore, LabeledScoreOwned
 ├── tests/
 │   ├── clap_integration.rs          # gated on TEXTCLAP_MODELS_DIR env var
@@ -353,7 +377,7 @@ example shows only the indexing path; STT / VAD integration is out of scope.
 - No `download` feature — no network.
 - No model bundling.
 - **No `ndarray`** — the mel filterbank multiply is small enough to write by hand; ONNX outputs are read
-  via `try_extract_raw_tensor::<f32>()` which yields `(Vec<i64>, &[f32])` directly.
+  via `try_extract_tensor::<f32>()` which yields `(Shape, &[f32])` (where `Shape: AsRef<[i64]>`) directly.
 - No `tracing` — observability is a §14 follow-up.
 - No `num_cpus` — `Options` does not expose thread counts.
 
@@ -376,8 +400,13 @@ enums and explicitly-fielded structs are public-as-data.
 
 ```rust
 pub struct Clap          { /* AudioEncoder + TextEncoder */ }
-pub struct AudioEncoder  { /* ort::Session + MelExtractor + encoder-owned scratch */ }
-pub struct TextEncoder   { /* ort::Session + Tokenizer + cached pad_id + encoder-owned scratch */ }
+pub struct AudioEncoder  { /* ort::Session + MelExtractor + encoder-owned scratch +
+                             audio_output_is_unit_norm: bool (set at construction from
+                             golden_onnx_io.json; selects centroid vs spherical-mean
+                             aggregation in embed_chunked and the trust-vs-renormalize
+                             path in embed/embed_batch). */ }
+pub struct TextEncoder   { /* ort::Session + Tokenizer + cached pad_id + encoder-owned scratch +
+                             text_output_is_unit_norm: bool (same role on the text side). */ }
 
 pub struct Embedding     { /* invariant: L2-normalized, internal storage [f32; 512] */ }
 
@@ -501,6 +530,10 @@ impl AudioEncoder {
     /// audio when the caller wants one embedding for the whole clip.
     /// Live indexing (§1.1) uses fixed 10 s windows + embed instead.
     ///
+    /// **For inputs ≤ window_samples** the chunking path produces a
+    /// single chunk and the result is bit-identical to embed(). Prefer
+    /// embed() in that case — fewer code paths, same answer.
+    ///
     /// **WARNING — not LAION-reference compatible.** LAION's reference for
     /// the unfused model uses single-window rand_trunc, not multi-window
     /// aggregation. textclap aggregates by either
@@ -508,7 +541,10 @@ impl AudioEncoder {
     /// (b) spherical-mean (mean of unit vectors) + L2-normalize.
     /// Which one is used depends on whether the ONNX export already
     /// L2-normalizes its output (§3.2 / golden_onnx_io.json determines
-    /// this). Cross-tool retrieval requires both sides to use textclap.
+    /// this). Embeddings produced via embed_chunked occupy a region of
+    /// CLAP-audio space that LAION-reference embeddings do not — querying
+    /// a textclap-indexed audio column with embeddings produced through
+    /// any other CLAP toolchain will not work.
     pub fn embed_chunked(&mut self, samples: &[f32], opts: &ChunkingOptions)
         -> Result<Embedding>;
 
@@ -614,17 +650,17 @@ impl Embedding {
     /// Reconstruct from a stored unit vector. Validates length AND norm
     /// (release-mode check: `(norm² − 1).abs() < 5e-5`).
     ///
-    /// **Round-trip assumption.** Goldens are L2-normalized by Rust in the
-    /// same float order they're written, so a stored embedding produced by
-    /// textclap and read back from the same lancedb cell on the same
-    /// hardware passes this check trivially. The check guards against
-    /// accidental mutation, truncation, or fp16 round-trip — NOT against
-    /// real cross-platform drift; cross-platform comparisons should use
-    /// is_close / is_close_cosine.
-    ///
-    /// fp16 storage round-trip is OUT OF SCOPE for this constructor —
-    /// fp16's ulp(1.0) ≈ 9.77e-4 makes the check fail; users converting
-    /// through fp16 should use from_slice_normalizing.
+    /// **Budget rationale.** The 5e-5 norm² budget absorbs cross-process
+    /// Arrow buffer round-tripping ULP drift (the realistic in-scope case);
+    /// it is intentionally not as tight as ULP because real Arrow
+    /// serializers / Parquet writers / network transports can introduce
+    /// small accumulated drift that is still semantically the same vector.
+    /// **It is NOT a cross-platform reproducibility check** — cross-platform
+    /// comparisons should use is_close_cosine. Truncation is caught earlier
+    /// by EmbeddingDimMismatch; fp16 storage round-trip is OUT OF SCOPE
+    /// (fp16's ulp(1.0) ≈ 9.77e-4 makes the check fail; users converting
+    /// through fp16 should use from_slice_normalizing). Tighten to 1e-6 if
+    /// real-world measurement supports it.
     pub fn try_from_unit_slice(s: &[f32]) -> Result<Self>;
 
     /// Construct from any non-zero slice; always re-normalizes to unit length
@@ -647,7 +683,11 @@ impl Embedding {
     /// **Implementation.** Computed as `0.5 · ‖self − other‖₂² < tol` for
     /// numerical stability — the algebraically-equivalent `1 − dot(a,b)`
     /// suffers catastrophic cancellation in fp32 for very-close vectors,
-    /// which matters for the text row of §12.2 (tol ~3e-8).
+    /// which matters for the text row of §12.2 (tol ~5e-8). The identity
+    /// `1 − cos(θ) = 0.5 · ‖a − b‖²` holds because the Embedding invariant
+    /// guarantees both operands are unit-norm to fp32 ULP — if a future
+    /// variant of Embedding ever stores non-unit-norm vectors, this
+    /// implementation must change to a guarded `1 − dot / (‖a‖·‖b‖)`.
     ///
     /// **Geometric meaning.** For unit vectors of dim d with max-abs drift ε,
     /// `1 − cos(θ) ≤ d · ε² / 2` (worst case). The closed-form rotation
@@ -814,15 +854,28 @@ Separate unit test asserts that `MelExtractor::extract_into` differs visibly fro
 > `inspect_onnx.py` before §3.4 step 3 lands.
 
 ```rust
-// Filled from golden_onnx_io.json by §3.4 step 3.
-pub(crate) const AUDIO_INPUT_NAME:  &str = "input_features";
-pub(crate) const AUDIO_OUTPUT_NAME: &str = "audio_embeds";   // example; verify via §3.2
+// Filled from golden_onnx_io.json by §3.4 step 3. Module-private (matches silero
+// session.rs:12 convention — wider visibility is unnecessary; these constants
+// are referenced only inside audio.rs).
+const AUDIO_INPUT_NAME:  &str = "input_features";
+const AUDIO_OUTPUT_NAME: &str = "audio_embeds";   // example; verify via §3.2
 ```
 
+`T` (the mel time dimension, recorded in `golden_params.json` per §3.1) is a `pub(crate) const T_FRAMES`
+defined in `mel.rs` and re-used here. It is a compile-time constant after §3.4 step 3 backfills the value;
+before backfill the §4 skeleton uses a placeholder.
+
 **Internal helper.** A single `pub(crate)` method runs the full forward pipeline (mel → ONNX) for any
-non-empty batch and writes raw model outputs into a caller-provided buffer:
+non-empty batch and writes raw model outputs into a caller-provided buffer. **Contract: prior contents of
+`out` are dropped — the function clears and resizes the buffer to `clips.len()` before writing.**
 
 ```rust
+/// Compute raw projections (un-normalized if §3.2 said the ONNX output is
+/// not internally L2-normalized; unit-norm if it is). Caller is responsible
+/// for any subsequent L2 normalization (skipped if the encoder's
+/// audio_output_is_unit_norm flag is true).
+///
+/// `out` is cleared on entry and resized to clips.len() before writing.
 pub(crate) fn embed_projections_batched(
     &mut self,
     clips: &[&[f32]],         // 1..=N clips, each 1..=480_000 samples
@@ -832,34 +885,35 @@ pub(crate) fn embed_projections_batched(
 
 Single-clip operations call this with `clips = &[samples]`. One path; no perf-profile ambiguity.
 
-§7.3.1 scratch-lifecycle contract applies to every `session.run()` here. Implementation pattern
-(rev-9 review noted the prior pseudo-code mixed in ndarray's `s!` / `as_array_ref`, which would not
-compile against the ndarray-free crate; rewritten here using ORT's actual API):
+§7.3.1 scratch-lifecycle contract applies to every `session.run()` here. Implementation pattern, using
+ORT 2.0.0-rc.12's actual API surface (verified against silero `src/session.rs:178-187` — single tuple
+form for `TensorRef::from_array_view`, and `try_extract_tensor` not `try_extract_raw_tensor`):
 
 ```rust
+use ort::value::TensorRef;
+
 let n = clips.len();
-let row_len = 64 * T;                                      // T from golden_params.json (compile-time const)
+let row_len = 64 * T_FRAMES;                                       // compile-time const after §3.4
 let total = n * row_len;
 
 self.mel_scratch.clear();
-self.mel_scratch.reserve(total);
-self.mel_scratch.resize(total, 0.0);                       // single grow + zero-fill
+self.mel_scratch.resize(total, 0.0);                               // grow + zero-fill in one step;
+                                                                   // reserve is redundant after resize
 for (i, clip) in clips.iter().enumerate() {
     self.mel.extract_into(
         clip,
-        &mut self.mel_scratch[i * row_len .. (i + 1) * row_len],  // &mut [f32]
+        &mut self.mel_scratch[i * row_len .. (i + 1) * row_len],   // &mut [f32]
     )?;
 }
 
-let input = TensorRef::from_array_view(
-    self.mel_scratch.as_slice(),
-    &[n as i64, 1, 64, T as i64],                          // channel dim added as a view
-)?;
+let input = TensorRef::from_array_view((
+    [n, 1usize, 64, T_FRAMES],                                     // shape: tuple of usize, NOT &[i64]
+    self.mel_scratch.as_slice(),                                   // data: &[f32]
+))?;
 
 let outputs = self.session.run(ort::inputs![AUDIO_INPUT_NAME => input])?;
-let raw = &outputs[AUDIO_OUTPUT_NAME];
-let (shape, data) = raw.try_extract_raw_tensor::<f32>()?;
-validate_shape("audio_output", &shape, &[n as i64, 512])?; // (actual, expected) per silero order
+let (shape, data) = outputs[AUDIO_OUTPUT_NAME].try_extract_tensor::<f32>()?;
+validate_shape("audio_output", shape.as_ref(), &[n as i64, 512])?; // shape.as_ref() yields &[i64]
 
 out.clear();
 out.reserve(n);
@@ -868,7 +922,7 @@ for i in 0..n {
     row.copy_from_slice(&data[i * 512 .. (i + 1) * 512]);
     out.push(row);
 }
-// tensor views drop here at end of scope
+// tensor views drop here at end of scope; mel_scratch becomes mutable again
 ```
 
 **`embed(samples)`:**
@@ -939,11 +993,15 @@ Loaded once at construction. textclap inspects the tokenizer to cache:
 > confirmed by `inspect_onnx.py` before §3.4 step 3.
 
 ```rust
-pub(crate) const TEXT_OUTPUT_NAME: &str = "text_embeds";   // example; verify via §3.2
+// Filled from golden_onnx_io.json by §3.4 step 3. Module-private (matches silero convention).
+const TEXT_INPUT_IDS_NAME:      &str = "input_ids";
+const TEXT_ATTENTION_MASK_NAME: &str = "attention_mask";
+const TEXT_POSITION_IDS_NAME:   &str = "position_ids";   // referenced only if §3.2 found this input
+const TEXT_OUTPUT_NAME:         &str = "text_embeds";    // example; verify via §3.2
 ```
 
-§7.3.1 scratch-lifecycle contract applies. ORT output extraction uses `try_extract_raw_tensor::<f32>()`
-exactly as in §8.2 (no ndarray).
+§7.3.1 scratch-lifecycle contract applies. ORT output extraction uses `try_extract_tensor::<f32>()` and
+`TensorRef::from_array_view((shape_tuple, data))` exactly as in §8.2 (no ndarray, no `try_extract_raw_tensor`).
 
 **`embed(text)`:**
 1. `text.is_empty()` → `Error::EmptyInput { batch_index: None }`.
@@ -951,8 +1009,9 @@ exactly as in §8.2 (no ndarray).
 3. `ids: Vec<i64>` — clear → reserve(T) → extend_from_slice from cast u32 ids. Same for `mask: Vec<i64>`.
 4. If §3.2 says `position_ids` is externalized: clear/reserve/extend `pos: Vec<i64>` computed from `mask`
    and the resolved `pad_id`.
-5. Bind tensor views, run, validate output shape `[1, 512]` via the §7.3.1 helper, copy out, drop views.
-6. L2-normalize → `Embedding` (or skip if §3.2 says outputs are already unit-norm).
+5. Bind tensor views via `TensorRef::from_array_view(([1usize, t], ids.as_slice()))?` for each input
+   tensor; run; validate output shape `[1, 512]` via the §7.3.1 helper; copy out; drop views.
+6. L2-normalize → `Embedding` (or skip if `text_output_is_unit_norm` is true).
 
 **`embed_batch(texts)`:**
 1. Empty slice → `Ok(Vec::new())`.
@@ -981,9 +1040,16 @@ pub enum Error {
     #[error("failed to load ONNX model from memory: {0}")]
     OnnxLoadFromMemory(#[source] ort::Error),
 
-    /// Failure inside the `tokenizers` crate when loading or initializing.
-    #[error("failed to load tokenizer: {0}")]
-    TokenizerLoad(#[source] tokenizers::Error),
+    /// Tokenizer load from a file path (matches OnnxLoadFromFile / silero LoadModel pattern).
+    #[error("failed to load tokenizer from {path}: {source}")]
+    TokenizerLoadFromFile {
+        path: PathBuf,
+        #[source] source: tokenizers::Error,
+    },
+
+    /// Tokenizer load from caller-supplied bytes (no path available).
+    #[error("failed to load tokenizer from memory: {0}")]
+    TokenizerLoadFromMemory(#[source] tokenizers::Error),
 
     /// tokenizer.json had no padding configuration AND no <pad> token.
     /// Either the JSON must declare padding, or it must contain a <pad> token
@@ -1049,10 +1115,16 @@ pub enum Error {
 }
 ```
 
-`Tokenize` and `TokenizerLoad` carry concrete `tokenizers::Error` (not boxed dyn), matching silero's
-sibling pattern. Configuration-time errors (`NoPadToken`, `PaddingFixedRejected`) are separate top-level
-variants, also matching sibling structure (silero's `InvalidChunkLength`, soundevents'
-`MissingRatedEventIndex`).
+`Tokenize`, `TokenizerLoadFromFile`, and `TokenizerLoadFromMemory` carry concrete `tokenizers::Error` (not
+boxed dyn), matching silero's sibling pattern. The path-carrying / memory-carrying split mirrors
+`OnnxLoadFromFile` / `OnnxLoadFromMemory` for symmetry. Configuration-time errors (`NoPadToken`,
+`PaddingFixedRejected`) are separate top-level variants, matching sibling structure (silero's
+`InvalidChunkLength`, soundevents' `MissingRatedEventIndex`).
+
+`Tokenize` is for runtime tokenization failures during `embed` / `embed_batch` calls. `embed_batch`
+returns a single `Tokenize` error from the underlying `tokenizer.encode_batch` — per-text indexing into
+the failure is not surfaced because the upstream API doesn't expose it. Callers needing per-text
+diagnostics can call `embed` per item.
 
 ## 11. Engineering robustness
 
@@ -1092,9 +1164,12 @@ candidate is the pangram repeated until it crosses the threshold; the maintainer
 post-tokenizer count and records the chosen string as `warmup_text` in `golden_params.json`.
 
 Sizes scratch for batch size 1; the first batched call (e.g. an offline backfill via `embed_batch(N=32)`)
-still grows scratch once. Magnitude: audio mel scratch grows from `64 · T · 4 ≈ 245 KB` (N=1) to
-`32 · 64 · T · 4 ≈ 7.85 MB` (N=32 batch), one-time, on the first big call.
-`warmup_for_batch(audio_n, text_n)` is a §14 follow-up.
+still grows scratch once. Magnitude: audio mel scratch grows from ~250 KB (N=1) to ~8 MB (N=32 batch),
+one-time, on the first big call. **Wall-clock impact:** typically 5–50 ms of one-time latency on the
+first batched call after warmup, accounting for the scratch growth itself plus ORT operator
+re-specialization for the new tensor shape. Amortized to zero across subsequent batches at the same N.
+`warmup_for_batch(audio_n, text_n)` is a §14 follow-up if this latency stutter ever becomes
+load-bearing.
 
 ### 11.5 Test determinism and platform variance
 
@@ -1167,9 +1242,10 @@ attribution responsibilities:
   - `dot ≈ cosine` for unit inputs (within fp32 ULP).
   - `is_close(&self, &self, 0.0)` returns true.
   - `is_close_cosine(&self, &self, 0.0)` returns true.
-  - **Cancellation safety:** `is_close_cosine` returns true for two embeddings differing by
-    `1e-9 * ones()` perturbation at `tol = 1e-12` (squared-distance impl handles fp32 cancellation
-    that direct `1 − dot` would mask).
+  - **Cancellation safety:** Construct `a = from_slice_normalizing(&[1.0; 512])` and
+    `b = from_slice_normalizing(&[(1.0 + 1e-9); 512])` (both end up unit-norm by construction). Assert
+    `a.is_close_cosine(&b, 1e-12)` returns true. The squared-distance implementation handles fp32
+    cancellation that the algebraically-equivalent `1 − dot(a, b)` would mask.
   - `to_vec` and `as_slice` are byte-equal.
   - **No `pub const DIM`** — compile-time test that `Embedding::DIM` doesn't resolve.
   - **Custom `Debug` output** does not contain 512 floats.
@@ -1192,7 +1268,7 @@ sized at ~1.5–2× the worst-case bound for headroom. Use these values when cal
 | Rust audio embedding vs golden (int8 vs int8)   | 5e-4                 | 1e-4                       | bound 6.4e-5 + ~1.5× headroom    |
 | Rust text embedding vs golden (int8 vs int8)    | 1e-5                 | 5e-8                       | bound 2.6e-8 + ~2× headroom      |
 | Cross-quantization audio (fp32 vs int8 ref)     | 1e-2                 | 5e-2                       | bound 2.6e-2 + ~2× headroom      |
-| Cross-platform reproducibility (CPU EP variance)| 1e-5                 | 5e-8                       | bound 2.6e-8 + ~2× headroom      |
+| Cross-platform reproducibility (CPU EP variance)| 1e-5 (preliminary)   | 5e-8 (preliminary)         | inherited from text-row math; int8-on-MLAS-vs-Accelerate variance has not been measured — widen if real-run measurement supports it |
 
 Cross-platform reproducibility refers to comparing embeddings produced on different OSes / CPU families
 (e.g. Linux MLAS vs macOS Accelerate, x86 vs ARM). On the *same* OS / hardware / thread / process,
@@ -1256,20 +1332,31 @@ textclap is currently the bare `al8n/template-rs` scaffold.
 
   ```rust
   // Indexing-only worker (saves ~120 MB resident vs Clap):
-  let mut audio = AudioEncoder::from_file("audio_model_quantized.onnx", Options::new())?;
-  audio.warmup()?;
-  loop {
-      let pcm = decoder.next_10s_at_48khz()?;     // caller-supplied
-      let emb = audio.embed(&pcm)?;
-      lancedb_writer.push(emb.as_slice(), ts_start, ts_end)?;
+  fn run_indexer() -> Result<(), Box<dyn std::error::Error>> {
+      let mut audio = AudioEncoder::from_file("audio_model_quantized.onnx", Options::new())?;
+      audio.warmup()?;
+      loop {
+          let pcm = decoder.next_10s_at_48khz()?;            // caller-supplied; arbitrary error
+          let emb = audio.embed(&pcm)?;                       // textclap::Error
+          lancedb_writer.push(emb.as_slice(), ts_start, ts_end)?;
+      }
   }
 
   // Query-only worker:
-  let mut text = TextEncoder::from_files("text_model_quantized.onnx", "tokenizer.json", Options::new())?;
-  text.warmup()?;
-  let q = text.embed(&user_query)?;
-  let hits = table.search(q.to_vec()).limit(10).execute().await?;
+  async fn run_query(user_query: &str) -> Result<(), Box<dyn std::error::Error>> {
+      let mut text = TextEncoder::from_files(
+          "text_model_quantized.onnx", "tokenizer.json", Options::new(),
+      )?;
+      text.warmup()?;
+      let q = text.embed(user_query)?;
+      let _hits = table.search(q.to_vec()).limit(10).execute().await?;
+      Ok(())
+  }
   ```
+
+  The `Box<dyn std::error::Error>` wrapper lets `?` mix textclap errors with caller-supplied decoder /
+  lancedb errors without writing `From` impls — idiomatic for examples and binaries; in library code
+  callers might layer their own concrete error type.
 
   Plus model-acquisition note pointing to HuggingFace **with SHA256s and HF revision pin**, the warning
   that `tokenizer.json` must come from the same Xenova export, model-attribution-on-downstream section
@@ -1330,8 +1417,9 @@ let sim = query.cosine(&stored);
 - `warmup_for_batch(audio_n: usize, text_n: usize)`.
 - A second chunking-aggregation strategy (max, attention pooling, mean-of-logits) if a real CLAP use case
   demonstrates value. Adding it brings back the `Aggregation` enum + `ChunkingOptions::with_aggregation`.
-- A `pad_mode: silence` option in `ChunkingOptions` (and per-call to `embed`?) to replace repeat-pad with
-  zero-pad for short clips (addresses §1.3 periodicity-artifact concern).
+- A `pad_mode: silence` option in `ChunkingOptions` to replace repeat-pad with zero-pad for short clips
+  in the chunking path (addresses §1.3 periodicity-artifact concern). A per-call override on `embed` is a
+  separate follow-up — not bundled here so the option's scope stays clear.
 - An optional **single-window LAION-reference mode** for offline clip embedding — single-window
   rand_trunc with a caller-provided RNG seed for cross-tool retrieval interop. Today's workaround:
   callers do `embed(&samples[..480_000.min(len)])` themselves.
