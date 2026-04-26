@@ -1,6 +1,6 @@
 # textclap — CLAP Inference Library Design
 
-**Status:** Draft (revision 15, post-rev-14 review — freeze candidate)
+**Status:** Approved (revision 16, freeze-ready post-rev-15 polish)
 **Date:** 2026-04-25
 **Target version:** 0.1.0
 
@@ -290,7 +290,9 @@ the README.
 3. **Spec-update commit.** Every TBD value in this spec is replaced with the resolved fixture-derived
    value. Complete checklist (deletions of "TBD" markers and "expected" qualifiers expected throughout):
    - §8.1 mel parameter table — `T` (frame count), `top_db`, HTSAT-input-norm action (`none` /
-     `global_mean_std` plus mean/std).
+     `global_mean_std` plus mean/std). If the action is `global_mean_std`, the mean/std values land as
+     `pub(crate) const HTSAT_INPUT_MEAN: f32` / `HTSAT_INPUT_STD: f32` in `mel.rs` (or are inlined into
+     the mel pipeline depending on the §3.2 decision). If `none`, no consts are added.
    - §8.2 — `AUDIO_INPUT_NAME`, `AUDIO_OUTPUT_NAME`, audio input shape (3-D vs 4-D channel dim).
    - §9.2 — `TEXT_INPUT_IDS_NAME`, `TEXT_ATTENTION_MASK_NAME`, optional `TEXT_POSITION_IDS_NAME`,
      `TEXT_OUTPUT_NAME`, plus the §7.4 attention-mask / position_ids description (inlined vs
@@ -540,6 +542,20 @@ impl AudioEncoder {
     /// §3.4 step 4. All three AudioEncoder constructors share the same const.
     /// Regardless of which constructor is used, the resulting `AudioEncoder`
     /// is `Send` but `!Sync` — thread-per-core deployment applies uniformly.
+    ///
+    /// **Detection asymmetry.** The two const-mismatch failure modes are
+    /// not symmetric:
+    /// - **const says `false` but ONNX is unit-norm.** Encoder runs the
+    ///   L2-normalize step on already-unit-norm vectors (idempotent identity
+    ///   to fp32 ULP). Harmless — wastes ~200 ns per call but produces
+    ///   correct output. No corruption.
+    /// - **const says `true` but ONNX is not unit-norm.** Encoder takes the
+    ///   trust path; the release-mode `NORM_BUDGET` guard rejects the output
+    ///   with `EmbeddingNotUnitNorm`. Loud, at write-time, before the
+    ///   invalid vector reaches lancedb.
+    /// The asymmetry is by design: false-says-true (the dangerous direction)
+    /// always errors loudly; false-says-false (the safe direction) wastes
+    /// CPU but never corrupts data.
     pub fn from_ort_session(session: ort::session::Session, opts: Options) -> Result<Self>;
 
     /// Single clip, length 0 < len ≤ 480_000 samples (10 s @ 48 kHz):
@@ -706,7 +722,12 @@ impl Embedding {
 
     /// Reconstruct from a stored unit vector. Validates length AND norm
     /// (release-mode check: `(norm² − 1).abs() ≤ NORM_BUDGET`, where
-    /// NORM_BUDGET = 1e-4 — see below).
+    /// `pub(crate) const NORM_BUDGET: f32 = 1e-4` is defined in `clap.rs`
+    /// alongside `Embedding` and referenced from `audio.rs` / `text.rs`.
+    /// Same const-at-module-top convention silero uses for its tensor
+    /// names (silero `session.rs:12` keeps them module-private; NORM_BUDGET
+    /// needs `pub(crate)` for cross-module use, but the structural pattern
+    /// is identical).
     ///
     /// **Budget rationale.** Arrow IPC and Parquet for f32 are byte-exact —
     /// no quantization or recomputation in transit. The realistic
@@ -834,6 +855,10 @@ impl Options {
 knob.** Sibling convention: deployment-specific runtime policy is configured one layer up via
 `from_ort_session`. Callers needing thread tuning, EP selection (CUDA, CoreML), or other ORT runtime
 knobs build their own `ort::Session` directly.
+
+**Naming.** `Options` follows soundevents' unqualified naming over silero's `SessionOptions`. Silero
+needs the `Session` qualifier to disambiguate from `SpeechOptions` (its segmentation tuning struct).
+textclap has no second options type, so unqualified `Options` is unambiguous and shorter at call sites.
 
 ### 7.8 `ChunkingOptions`
 
@@ -1082,6 +1107,12 @@ for i in 0..n {
 
    Single-chunk case skips aggregation regardless of branch.
 
+   Both branches end with the same finalization: a local L2-normalize ensures unit-norm by construction,
+   and the produced `Embedding` is wrapped via the same trust-path / non-trust-path branch that single-clip
+   `embed` uses (step 5). This is **not a sixth NORM_BUDGET site** — `embed_chunked` reuses the audio
+   `embed` finalization and inherits site 1's guard, which catches any rounding pathology consistent
+   with the other five sites.
+
 **Allocation budget per call (after warmup):**
 - `embed`: only the output `Embedding`.
 - `embed_batch(N)`: `Vec<Embedding>` of N entries; mel scratch grows once per new max size.
@@ -1268,6 +1299,13 @@ boxed dyn), matching silero's sibling pattern. The path-carrying / memory-carryi
 explicitly via `.map_err(|e| Error::OnnxLoadFromFile { path, source: e })?` so the path is captured.
 Runtime ORT errors during `session.run()` fall through `#[from] ort::Error` to the catch-all `Onnx`
 variant — no path context is meaningful at that point.
+
+**Deliberate divergence from silero `UnexpectedOutputShape`.** silero's variant carries only
+`{ tensor: &'static str, shape: Vec<i64> }` — `expected` is implicit from the tensor name and the
+calling site. textclap's `UnexpectedTensorShape` adds an explicit `expected: Vec<i64>` field. textclap
+has more diverse tensor shapes across audio (4-D), text (2-D), and outputs (2-D) than silero's narrower
+audio-only graph, so carrying `expected` makes the error self-describing without requiring callers to
+reverse the calling site. Acceptable structural addition; no API risk.
 
 `Tokenize` is for runtime tokenization failures during `embed` / `embed_batch` calls. `embed_batch`
 returns a single `Tokenize` error from the underlying `tokenizer.encode_batch` — per-text indexing into
@@ -1661,5 +1699,8 @@ let sim = query.cosine(&stored);
 - **Tighten `NORM_BUDGET` from 1e-4 to 5e-5** once first-run BLAS-variation telemetry confirms safety.
   The §7.5 rationale explains the asymmetric-rollback argument for shipping at 1e-4: rolling back to
   5e-5 if measurement supports it is a low-stakes spec edit, while rolling forward from a 5e-5
-  production failure would be a higher-stakes patch. Tracking it here makes the future tightening a
-  registered task rather than an inline comment.
+  production failure would be a higher-stakes patch. **Realistic target depends on telemetry**: the
+  worst-case bound is ~6.1e-5 (§7.5 BLAS-vs-sequential-sum derivation), so 5e-5 is achievable only if
+  observed drift is ≪ worst-case. If telemetry shows actual drift hitting ≥ 5e-5, the realistic
+  tightening target is ~7e-5 (just above worst-case with margin) rather than 5e-5. Tracking this as
+  a registered task rather than an inline comment.
