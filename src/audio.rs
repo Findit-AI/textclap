@@ -3,10 +3,11 @@
 use std::path::Path;
 
 use ort::session::Session;
+use ort::value::TensorRef;
 
 use crate::clap_model::Embedding;
 use crate::error::{Error, Result};
-use crate::mel::MelExtractor;
+use crate::mel::{MelExtractor, T_FRAMES};
 use crate::options::Options;
 
 // Backfilled from golden_onnx_io.json per §3.4. Module-private.
@@ -149,5 +150,77 @@ impl AudioEncoder {
   /// Run a dummy forward to amortize ORT operator specialization and size scratch.
   pub fn warmup(&mut self) -> Result<()> {
     unimplemented!("AudioEncoder::warmup — implemented in Task 21")
+  }
+}
+
+impl AudioEncoder {
+  /// Compute the audio model's raw projection outputs. These are un-normalized 512-dim vectors if
+  /// `AUDIO_OUTPUT_IS_UNIT_NORM == false`, or already-unit-norm vectors if true. Callers handle
+  /// any subsequent normalization or release-mode unit-norm guard themselves.
+  ///
+  /// `out` is cleared on entry; capacity is reserved for `clips.len()` entries and one row is
+  /// pushed per clip. Prior contents are dropped.
+  ///
+  /// The chunked path's per-call accumulator is a *separate* `Vec` from `self.proj_scratch`;
+  /// see spec §8.2.
+  #[allow(dead_code)] // Used by Tasks 19-21.
+  pub(crate) fn embed_projections_batched(
+    &mut self,
+    clips: &[&[f32]],
+    out: &mut Vec<[f32; 512]>,
+  ) -> Result<()> {
+    let n = clips.len();
+    debug_assert!(n > 0, "embed_projections_batched requires non-empty input");
+
+    let row_len = N_MELS * T_FRAMES;
+    let total = n * row_len;
+
+    // §7.3.1 scratch lifecycle: clear + resize before binding any tensor view.
+    self.mel_scratch.clear();
+    self.mel_scratch.resize(total, 0.0);
+
+    for (i, clip) in clips.iter().enumerate() {
+      let row_start = i * row_len;
+      let row_end = row_start + row_len;
+      self
+        .mel
+        .extract_into(clip, &mut self.mel_scratch[row_start..row_end])?;
+    }
+
+    // Bind tensor view AFTER all resizes complete. Borrow checker prevents subsequent mutation.
+    // Tensor shape is [n, 1, T_FRAMES, N_MELS] (time-major), matching the HF extractor's
+    // [batch, channel, T, mel_bins] layout.
+    let input_shape = [n, 1usize, T_FRAMES, N_MELS];
+    let input = TensorRef::from_array_view((input_shape, self.mel_scratch.as_slice()))?;
+
+    let outputs = self.session.run(ort::inputs![AUDIO_INPUT_NAME => input])?;
+    let (shape, data) = outputs[AUDIO_OUTPUT_NAME].try_extract_tensor::<f32>()?;
+    validate_shape(
+      "audio_output",
+      shape.as_ref(),
+      &[n as i64, EMBEDDING_DIM as i64],
+    )?;
+
+    out.clear();
+    out.reserve(n);
+    for i in 0..n {
+      let mut row = [0.0f32; EMBEDDING_DIM];
+      row.copy_from_slice(&data[i * EMBEDDING_DIM..(i + 1) * EMBEDDING_DIM]);
+      out.push(row);
+    }
+    // Tensor views drop here; mel_scratch becomes mutable again.
+    Ok(())
+  }
+
+  /// SIMD-friendly finiteness scan. Returns `Some(index)` of the first non-finite sample, or `None`.
+  /// Cost ~50 µs over 480 000 samples — dwarfed by ONNX inference.
+  #[allow(dead_code)] // Used by Tasks 19-21.
+  fn first_non_finite(samples: &[f32]) -> Option<usize> {
+    for (i, &v) in samples.iter().enumerate() {
+      if !v.is_finite() {
+        return Some(i);
+      }
+    }
+    None
   }
 }
