@@ -384,9 +384,12 @@ def _step_text_goldens(fixtures: Path, models: Path, onnx_io: dict) -> None:
         }
         if onnx_io.get("text_position_ids_name"):
             pad_id = onnx_io.get("text_pad_id", 1)
-            # RoBERTa: pos = pad_id + 1 + cumsum(non_pad_mask) over the non-pad span
-            pos = np.cumsum(mask, axis=1, dtype=np.int64) + pad_id
-            pos = pos * mask  # zero-out padded positions (matches model's masked positions)
+            # RoBERTa create_position_ids_from_input_ids reference (HuggingFace transformers):
+            #   incremental_indices = cumsum(mask) * mask
+            #   return incremental_indices + padding_idx
+            # The * mask must come BEFORE + padding_idx so padded positions get padding_idx,
+            # NOT zero. (cumsum + pad_id) * mask is wrong — it zeroes pad positions.
+            pos = np.cumsum(mask, axis=1, dtype=np.int64) * mask + pad_id
             feeds[onnx_io["text_position_ids_name"]] = pos.astype(np.int64)
 
         raw = text_session.run([onnx_io["text_output_name"]], feeds)[0]
@@ -784,6 +787,13 @@ Same for `top_db` (use the literal value from JSON: either `None` or the recorde
 For HTSAT input norm: replace `**TBD by §3.2 functional check**` with one of:
 - `none` (no normalization needed in mel.rs post-log-mel step), or
 - `global_mean_std (mean=−4.27, std=4.57)` (subtract / divide after log-mel; values from `golden_params.json`).
+
+**If the chosen type is `global_mean_std`**, also uncomment the corresponding Rust lines in two
+places: (a) the `pub(crate) const HTSAT_INPUT_MEAN: f32 = …; HTSAT_INPUT_STD: f32 = …;` block at
+the top of `mel.rs` (Task 12 step 1, currently commented out), and (b) the
+`let db = (db - HTSAT_INPUT_MEAN) / HTSAT_INPUT_STD;` line inside `extract_into` (Task 16 step 3,
+currently a comment in the pseudo-code). If the type is `none`, leave both regions commented — no
+consts get added and no normalization runs.
 
 - [ ] **Step 3: Edit §8.2 / §9.2 tensor names and shapes**
 
@@ -1738,7 +1748,7 @@ pub struct Embedding {
 - [ ] **Step 5: Run the embedding tests**
 
 ```bash
-cargo test --lib clap::tests
+cargo test --lib clap_model::tests
 ```
 
 Expected: all 11 tests pass, including the cancellation-safety test. The `compile_fail` doctests run
@@ -1846,7 +1856,7 @@ Inside `mod tests { ... }`:
 - [ ] **Step 3: Run tests**
 
 ```bash
-cargo test --lib clap::tests::labeled_score
+cargo test --lib clap_model::tests::labeled_score
 ```
 
 Expected: 2 tests pass.
@@ -2204,15 +2214,18 @@ mod tests {
             assert!(v >= 0.0 && v <= 1.0 + 1e-7);
         }
 
-        // Peak invariant: max value lives near the middle. For n=1024, the maximum occurs at k=512
-        // and equals 0.5·(1 − cos(2π·512/1025)) = 0.5·(1 − cos(1024π/1025)). Numerically this is
-        // approximately 0.999996 — close to but NOT exactly 1.
+        // Peak invariant: the symmetry axis for periodic Hann at n=1024 sits at index 512.5, so
+        // win[512] and win[513] are algebraically tied at 0.5·(1 − cos(π/1025)) ≈ 0.999996. fp32
+        // rounding can put either as the peak; accept both.
         let max_idx = win.iter().enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .unwrap().0;
-        assert_eq!(max_idx, 512, "peak should be at center index 512");
-        assert!(win[512] > 0.999 && win[512] < 1.0 + 1e-6,
+        assert!(max_idx == 512 || max_idx == 513,
+            "peak should be at index 512 or 513 (algebraic tie at 512.5); got {max_idx}");
+        assert!(win[512] > 0.999 && win[512] <= 1.0 + 1e-6,
             "win[512] should be near 1; got {}", win[512]);
+        assert!((win[512] - win[513]).abs() < 1e-6,
+            "win[512] and win[513] should be tied; got {} vs {}", win[512], win[513]);
     }
 }
 ```
@@ -2867,8 +2880,8 @@ impl AudioEncoder {
 }
 ```
 
-(The exact `ort 2.0.0-rc.12` API for `SessionBuilder` may differ slightly — verify against
-silero `src/session.rs` and adapt the chain if needed. The error mapping pattern stays the same.)
+(The session-construction chain matches silero `src/session.rs:97–104` byte-for-byte; no further
+adaptation is needed in `ort 2.0.0-rc.12`.)
 
 - [ ] **Step 4: Smoke-test the constructor with a minimal `cargo build`**
 
@@ -3361,6 +3374,11 @@ const EMBEDDING_DIM: usize = 512;
 pub struct TextEncoder {
     session: Session,
     tokenizer: Tokenizer,
+    /// Cached at construction. Used when §3.2 found `position_ids` as an externalized ONNX input
+    /// (uncomment the position-ids-build block in `embed`/`embed_batch` if so). When position_ids
+    /// is inlined into the graph (the typical Xenova export), `pad_id` is unused at the embed
+    /// hot path but kept for diagnostic / reflection use; resolution-time validation already
+    /// happened in `resolve_pad_id` so the field is the source of truth for the configured pad.
     pad_id: i64,
     /// Reused scratch.
     ids_scratch: Vec<i64>,
