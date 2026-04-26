@@ -1,11 +1,21 @@
-//! A template for creating Rust open-source repo on GitHub
-#![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(docsrs, feature(doc_cfg))]
-#![cfg_attr(docsrs, allow(unused_attributes))]
+//! textclap — CLAP (Contrastive Language-Audio Pre-training) inference library.
+//!
+//! See `docs/superpowers/specs/` for the full design spec.
+
 #![deny(missing_docs)]
+#![forbid(unsafe_code)]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
-#[cfg(all(not(feature = "std"), feature = "alloc"))]
-extern crate alloc as std;
+mod audio;
+mod clap_model;            // not `mod clap` to avoid shadowing the `clap` CLI crate if a future
+                           // dev-dep pulls it in
+mod error;
+mod mel;
+mod options;
+mod text;
 
-#[cfg(feature = "std")]
-extern crate std;
+pub use crate::audio::AudioEncoder;
+pub use crate::clap_model::{Clap, Embedding, LabeledScore, LabeledScoreOwned};
+pub use crate::error::{Error, Result};
+pub use crate::options::{ChunkingOptions, GraphOptimizationLevel, Options};
+pub use crate::text::TextEncoder;

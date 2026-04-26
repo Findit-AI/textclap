@@ -1,48 +1,65 @@
 [package]
-name = "template-rs"
-version = "0.0.0"
-edition = "2021"
-repository = "https://github.com/al8n/template-rs"
-homepage = "https://github.com/al8n/template-rs"
-documentation = "https://docs.rs/template-rs"
-description = "A template for creating Rust open-source repo on GitHub"
+name = "textclap"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Rust ONNX inference library for LAION CLAP-HTSAT-unfused"
 license = "MIT OR Apache-2.0"
-rust-version = "1.73"
-
-[[bench]]
-path = "benches/foo.rs"
-name = "foo"
-harness = false
-
-[features]
-default = ["std"]
-alloc = []
-std = []
+repository = "https://github.com/Findit-AI/textclap"
+keywords = ["clap", "audio", "embedding", "onnx", "ml"]
+categories = ["multimedia::audio", "science"]
+include = [
+    "src/**/*.rs",
+    "build.rs",
+    "Cargo.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE-*",
+    "COPYRIGHT",
+]
 
 [dependencies]
+ort        = "2.0.0-rc.12"
+rustfft    = "6"
+tokenizers = "0.20"
+thiserror  = "2"
+serde      = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
-criterion = "0.8"
-tempfile = "3"
+criterion = "0.5"
+rubato    = "0.16"
+npyz      = "0.8"
+hound     = "3"
 
-[profile.bench]
-opt-level = 3
-debug = false
-codegen-units = 1
-lto = 'thin'
-incremental = false
-debug-assertions = false
-overflow-checks = false
-rpath = false
-
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
+[features]
+default = []
+serde   = ["dep:serde"]
 
 [lints.rust]
-rust_2018_idioms = "warn"
-single_use_lifetimes = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = [
-  'cfg(all_tests)',
-  'cfg(tarpaulin)',
-] }
+rust_2018_idioms      = "warn"
+single_use_lifetimes  = "warn"
+unexpected_cfgs       = { level = "warn", check-cfg = ['cfg(all_tests)', 'cfg(tarpaulin)'] }
+
+[package.metadata.docs.rs]
+all-features  = true
+rustdoc-args  = ["--cfg", "docsrs"]
+
+[[bench]]
+name    = "bench_mel"
+harness = false
+
+[[bench]]
+name    = "bench_audio_encode"
+harness = false
+
+[[bench]]
+name    = "bench_text_encode"
+harness = false
+
+[[example]]
+name              = "audio_window_to_clap"
+required-features = []
+
+[[example]]
+name              = "index_and_search"
+required-features = []
