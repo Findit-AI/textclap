@@ -171,6 +171,63 @@ impl fmt::Debug for Embedding {
     }
 }
 
+/// Single classification result borrowing its label from the input slice. See spec §7.6.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct LabeledScore<'a> {
+    label: &'a str,
+    score: f32,
+}
+
+impl<'a> LabeledScore<'a> {
+    pub(crate) const fn new(label: &'a str, score: f32) -> Self {
+        Self { label, score }
+    }
+
+    /// The label borrowed from the caller's input slice.
+    pub const fn label(&self) -> &'a str {
+        self.label
+    }
+
+    /// Cosine similarity score in roughly `[-1, 1]`.
+    pub const fn score(&self) -> f32 {
+        self.score
+    }
+
+    /// Convert to an owned variant for cross-thread send / serialization / DB rows.
+    pub fn to_owned(&self) -> LabeledScoreOwned {
+        LabeledScoreOwned {
+            label: self.label.to_string(),
+            score: self.score,
+        }
+    }
+}
+
+/// Owned variant of `LabeledScore` — owns its label string.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct LabeledScoreOwned {
+    label: String,
+    score: f32,
+}
+
+impl LabeledScoreOwned {
+    /// Borrow the label.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Cosine similarity score.
+    pub const fn score(&self) -> f32 {
+        self.score
+    }
+
+    /// Consume self, returning the owned label.
+    pub fn into_label(self) -> String {
+        self.label
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +344,23 @@ mod tests {
         assert!(s.contains("dim: 512"));
         assert!(s.contains("head:"));
         assert!(s.matches(',').count() < 10);
+    }
+
+    #[test]
+    fn labeled_score_borrowed_round_trip() {
+        let label = "a dog barking".to_string();
+        let s = LabeledScore::new(&label, 0.42);
+        assert_eq!(s.label(), "a dog barking");
+        assert_eq!(s.score(), 0.42);
+    }
+
+    #[test]
+    fn labeled_score_to_owned_preserves_fields() {
+        let label = "rain".to_string();
+        let borrowed = LabeledScore::new(&label, -0.13);
+        let owned = borrowed.to_owned();
+        assert_eq!(owned.label(), "rain");
+        assert_eq!(owned.score(), -0.13);
+        assert_eq!(owned.into_label(), "rain");
     }
 }
