@@ -67,26 +67,30 @@ def main() -> None:
     print(f"All goldens written to {fixtures}/")
 
 
-if __name__ == "__main__":
-    main()
-
-
 def _step_extractor_and_mel(fixtures: Path, onnx_io: dict) -> None:
     """ §3.1 step 2-3: extract parameters + golden mel features."""
     extractor = ClapFeatureExtractor.from_pretrained("laion/clap-htsat-unfused")
 
     audio, _ = librosa.load(str(fixtures / "sample.wav"), sr=48000, mono=True)
     features = extractor(audio, sampling_rate=48000, return_tensors="pt")
-    mel = features["input_features"].numpy()  # shape varies — flatten to [64, T]
+    mel = features["input_features"].numpy()
+    # The HF extractor produces [batch, channel, T, mel_bins] (time-major), NOT [batch, channel,
+    # mel_bins, T] as the original spec §8.1 assumed. We save in the extractor's native layout —
+    # the ONNX audio model consumes the same layout via TensorRef. Task 6 (spec backfill) corrects
+    # the §8.1 / §8.2 spec wording.
     if mel.ndim == 4:
-        mel_2d = mel[0, 0]
+        mel_2d = mel[0, 0]            # [T, 64]
     elif mel.ndim == 3:
-        mel_2d = mel[0]
+        mel_2d = mel[0]                # [T, 64]
     else:
         raise ValueError(f"unexpected mel shape from extractor: {mel.shape}")
+    assert mel_2d.shape[1] == 64, (
+        f"expected mel_bins=64 on axis 1; got shape {mel_2d.shape}. The extractor's layout may "
+        f"have changed in this transformers version."
+    )
     np.save(fixtures / "golden_mel.npy", mel_2d.astype(np.float32))
 
-    T = int(mel_2d.shape[1])
+    T = int(mel_2d.shape[0])
     params = {
         "sampling_rate": int(extractor.sampling_rate),
         "feature_size": int(extractor.feature_size),
@@ -160,10 +164,9 @@ def _step_text_goldens(fixtures: Path, models: Path, onnx_io: dict) -> None:
         enc = tok.encode(label)
         ids = np.array([enc.ids], dtype=np.int64)
         mask = np.array([enc.attention_mask], dtype=np.int64)
-        feeds = {
-            onnx_io["text_input_ids_name"]: ids,
-            onnx_io["text_attention_mask_name"]: mask,
-        }
+        feeds = {onnx_io["text_input_ids_name"]: ids}
+        if onnx_io.get("text_attention_mask_name"):
+            feeds[onnx_io["text_attention_mask_name"]] = mask
         if onnx_io.get("text_position_ids_name"):
             pad_id = onnx_io.get("text_pad_id", 1)
             # RoBERTa create_position_ids_from_input_ids reference (HuggingFace transformers):
@@ -190,3 +193,7 @@ def _step_filterbank_rows(fixtures: Path) -> None:
     np.save(fixtures / "filterbank_row_0.npy",  fb[0].astype(np.float32))
     np.save(fixtures / "filterbank_row_10.npy", fb[10].astype(np.float32))  # near 1 kHz Slaney inflection
     np.save(fixtures / "filterbank_row_32.npy", fb[32].astype(np.float32))
+
+
+if __name__ == "__main__":
+    main()

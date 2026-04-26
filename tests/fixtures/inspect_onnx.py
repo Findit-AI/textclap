@@ -53,10 +53,6 @@ def main() -> None:
           f"(drift={htsat_norm['drift_at_chosen']:.3e})")
 
 
-if __name__ == "__main__":
-    main()
-
-
 def _inspect_audio(proto: onnx.ModelProto) -> dict:
     g = proto.graph
     [audio_in] = list(g.input)
@@ -102,9 +98,11 @@ def _inspect_text(proto: onnx.ModelProto) -> dict:
     g = proto.graph
     inputs_by_name = {i.name: i for i in g.input}
 
-    # RoBERTa exports always have input_ids and attention_mask. Some externalize position_ids.
+    # input_ids is always present. attention_mask and position_ids may or may not be externalized
+    # depending on the export (the Xenova clap-htsat-unfused export inlines BOTH derivations into
+    # the graph and exposes only input_ids).
     text_input_ids_name      = next(n for n in inputs_by_name if "input_ids" in n.lower())
-    text_attention_mask_name = next(n for n in inputs_by_name if "attention" in n.lower() and "mask" in n.lower())
+    text_attention_mask_name = next((n for n in inputs_by_name if "attention" in n.lower() and "mask" in n.lower()), None)
     text_position_ids_name   = next((n for n in inputs_by_name if "position" in n.lower()), None)
 
     [text_out] = list(g.output)
@@ -145,9 +143,13 @@ def _functional_verify(models: Path, fixtures: Path, onnx_io: dict) -> dict:
     assert features["input_features"].shape[0] == 1, "verification expects batch_size=1"
 
     # PyTorch fp32 reference, with no_grad (params have requires_grad=True even in eval).
+    # transformers 5.x returns BaseModelOutputWithPooling from get_audio_features; the projected
+    # embedding lives at .pooler_output (shape [B, 512]). Older 4.x versions returned the tensor
+    # directly — handle both.
     with torch.no_grad():
-        pt_emb = pt_model.get_audio_features(**features)
-        pt_emb = F.normalize(pt_emb, dim=-1)  # robust to any batch size
+        pt_out = pt_model.get_audio_features(**features)
+        pt_emb_tensor = pt_out.pooler_output if hasattr(pt_out, "pooler_output") else pt_out
+        pt_emb = F.normalize(pt_emb_tensor, dim=-1)  # robust to any batch size
     pt_emb_np = pt_emb.numpy().reshape(-1)
 
     results = {}
@@ -179,3 +181,6 @@ def _functional_verify(models: Path, fixtures: Path, onnx_io: dict) -> dict:
         "drift_at_chosen": drift,
         "drifts_all_transforms": results,
     }
+
+if __name__ == "__main__":
+    main()
