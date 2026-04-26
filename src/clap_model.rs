@@ -2,6 +2,9 @@
 
 use std::{fmt, path::Path};
 
+use derive_more::{AsRef, Deref, Display};
+use smol_str::{SmolStr, ToSmolStr};
+
 use crate::{
   audio::AudioEncoder,
   error::{Error, Result},
@@ -39,24 +42,27 @@ pub(crate) const NORM_BUDGET: f32 = 1e-4;
 /// # let b = a.clone();
 /// let _ = a == b;
 /// ```
-#[derive(Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, AsRef, Deref)]
+#[repr(transparent)]
 pub struct Embedding {
   inner: [f32; 512],
 }
 
 impl Embedding {
   /// Length of the embedding (512 in 0.1.0).
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn dim(&self) -> usize {
     self.inner.len()
   }
 
   /// Borrow the embedding as a slice — supports `append_slice` into Arrow's `MutableBuffer`.
-  pub fn as_slice(&self) -> &[f32] {
-    &self.inner
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_slice(&self) -> &[f32] {
+    self.inner.as_slice()
   }
 
   /// Owned conversion to a `Vec<f32>`. Allocates.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn to_vec(&self) -> Vec<f32> {
     self.inner.to_vec()
   }
@@ -172,6 +178,7 @@ impl Embedding {
 }
 
 impl AsRef<[f32]> for Embedding {
+  #[cfg_attr(not(tarpaulin), inline(always))]
   fn as_ref(&self) -> &[f32] {
     self.as_slice()
   }
@@ -199,24 +206,28 @@ pub struct LabeledScore<'a> {
 }
 
 impl<'a> LabeledScore<'a> {
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub(crate) const fn new(label: &'a str, score: f32) -> Self {
     Self { label, score }
   }
 
   /// The label borrowed from the caller's input slice.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn label(&self) -> &'a str {
     self.label
   }
 
   /// Cosine similarity score in roughly `[-1, 1]`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn score(&self) -> f32 {
     self.score
   }
 
   /// Convert to an owned variant for cross-thread send / serialization / DB rows.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn to_owned(&self) -> LabeledScoreOwned {
     LabeledScoreOwned {
-      label: self.label.to_string(),
+      label: self.label.to_smolstr(),
       score: self.score,
     }
   }
@@ -226,23 +237,26 @@ impl<'a> LabeledScore<'a> {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LabeledScoreOwned {
-  label: String,
+  label: SmolStr,
   score: f32,
 }
 
 impl LabeledScoreOwned {
   /// Borrow the label.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn label(&self) -> &str {
-    &self.label
+    self.label.as_str()
   }
 
   /// Cosine similarity score.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn score(&self) -> f32 {
     self.score
   }
 
   /// Consume self, returning the owned label.
-  pub fn into_label(self) -> String {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_label(self) -> SmolStr {
     self.label
   }
 }

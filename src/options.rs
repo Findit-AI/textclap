@@ -9,6 +9,72 @@
 
 pub use ort::session::builder::GraphOptimizationLevel;
 
+#[cfg(feature = "serde")]
+mod graph_optimization_level {
+  use super::GraphOptimizationLevel;
+  use serde::*;
+
+  #[derive(
+    Debug, Default, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize,
+  )]
+  #[serde(rename_all = "snake_case")]
+  enum OptimizationLevel {
+    #[default]
+    Disable,
+    Level1,
+    Level2,
+    Level3,
+    All,
+  }
+
+  impl From<GraphOptimizationLevel> for OptimizationLevel {
+    #[inline]
+    fn from(value: GraphOptimizationLevel) -> Self {
+      match value {
+        GraphOptimizationLevel::Disable => Self::Disable,
+        GraphOptimizationLevel::Level1 => Self::Level1,
+        GraphOptimizationLevel::Level2 => Self::Level2,
+        GraphOptimizationLevel::Level3 => Self::Level3,
+        GraphOptimizationLevel::All => Self::All,
+      }
+    }
+  }
+
+  impl From<OptimizationLevel> for GraphOptimizationLevel {
+    #[inline]
+    fn from(value: OptimizationLevel) -> Self {
+      match value {
+        OptimizationLevel::Disable => Self::Disable,
+        OptimizationLevel::Level1 => Self::Level1,
+        OptimizationLevel::Level2 => Self::Level2,
+        OptimizationLevel::Level3 => Self::Level3,
+        OptimizationLevel::All => Self::All,
+      }
+    }
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn serialize<S>(level: &GraphOptimizationLevel, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: Serializer,
+  {
+    OptimizationLevel::from(*level).serialize(serializer)
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn deserialize<'de, D>(deserializer: D) -> Result<GraphOptimizationLevel, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    OptimizationLevel::deserialize(deserializer).map(Into::into)
+  }
+
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn default() -> GraphOptimizationLevel {
+    GraphOptimizationLevel::Disable
+  }
+}
+
 /// Construction-time options for textclap encoders.
 ///
 /// `Default` is implemented manually rather than derived because
@@ -17,10 +83,18 @@ pub use ort::session::builder::GraphOptimizationLevel;
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Options {
-  graph_optimization_level: GraphOptimizationLevel,
+  #[cfg_attr(
+    feature = "serde",
+    serde(
+      default = "graph_optimization_level::default",
+      with = "graph_optimization_level"
+    )
+  )]
+  optimization_level: GraphOptimizationLevel,
 }
 
 impl Default for Options {
+  #[cfg_attr(not(tarpaulin), inline(always))]
   fn default() -> Self {
     Self::new()
   }
@@ -28,29 +102,47 @@ impl Default for Options {
 
 impl Options {
   /// Construct with default values (== `Self::default()`).
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
-      graph_optimization_level: GraphOptimizationLevel::Level3,
+      optimization_level: GraphOptimizationLevel::Level3,
     }
   }
 
   /// Set the ORT graph-optimization level (consuming builder).
-  pub const fn with_graph_optimization_level(mut self, level: GraphOptimizationLevel) -> Self {
-    self.graph_optimization_level = level;
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_optimization_level(mut self, level: GraphOptimizationLevel) -> Self {
+    self.set_optimization_level(level);
     self
   }
 
   /// Set the ORT graph-optimization level (in-place setter).
-  pub const fn set_graph_optimization_level(&mut self, level: GraphOptimizationLevel) -> &mut Self {
-    self.graph_optimization_level = level;
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_optimization_level(&mut self, level: GraphOptimizationLevel) -> &mut Self {
+    self.optimization_level = level;
     self
   }
 
   /// Get the configured graph-optimization level.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn graph_optimization_level(&self) -> GraphOptimizationLevel {
-    self.graph_optimization_level
+  pub const fn optimization_level(&self) -> GraphOptimizationLevel {
+    self.optimization_level
   }
+}
+
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn default_window_samples() -> usize {
+  480_000
+}
+
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn default_hop_samples() -> usize {
+  480_000
+}
+
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn default_batch_size() -> usize {
+  8
 }
 
 /// Chunking-window configuration for `embed_chunked`.
@@ -60,30 +152,36 @@ impl Options {
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ChunkingOptions {
+  #[cfg_attr(feature = "serde", serde(default = "default_window_samples"))]
   window_samples: usize,
+  #[cfg_attr(feature = "serde", serde(default = "default_hop_samples"))]
   hop_samples: usize,
+  #[cfg_attr(feature = "serde", serde(default = "default_batch_size"))]
   batch_size: usize,
 }
 
 impl Default for ChunkingOptions {
+  #[cfg_attr(not(tarpaulin), inline(always))]
   fn default() -> Self {
-    Self {
-      window_samples: 480_000,
-      hop_samples: 480_000,
-      batch_size: 8,
-    }
+    Self::new()
   }
 }
 
 impl ChunkingOptions {
   /// Construct with default values (window=480_000, hop=480_000, batch_size=8).
-  pub fn new() -> Self {
-    Self::default()
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new() -> Self {
+    Self {
+      window_samples: default_window_samples(),
+      hop_samples: default_hop_samples(),
+      batch_size: default_batch_size(),
+    }
   }
 
   /// Set the window length in samples (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_window_samples(mut self, n: usize) -> Self {
-    self.window_samples = n;
+    self.set_window_samples(n);
     self
   }
 
@@ -100,12 +198,14 @@ impl ChunkingOptions {
   }
 
   /// Set the hop length in samples (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_hop_samples(mut self, n: usize) -> Self {
-    self.hop_samples = n;
+    self.set_hop_samples(n);
     self
   }
 
   /// Set the hop length in samples (in-place setter).
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_hop_samples(&mut self, n: usize) -> &mut Self {
     self.hop_samples = n;
     self
@@ -118,12 +218,14 @@ impl ChunkingOptions {
   }
 
   /// Set the maximum batch size (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_batch_size(mut self, n: usize) -> Self {
-    self.batch_size = n;
+    self.set_batch_size(n);
     self
   }
 
   /// Set the maximum batch size (in-place setter).
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_batch_size(&mut self, n: usize) -> &mut Self {
     self.batch_size = n;
     self
@@ -144,26 +246,20 @@ mod tests {
   fn options_default_matches_new() {
     let a = Options::new();
     let b = Options::default();
-    assert_eq!(a.graph_optimization_level(), b.graph_optimization_level());
+    assert_eq!(a.optimization_level(), b.optimization_level());
   }
 
   #[test]
   fn options_with_round_trips() {
-    let opts = Options::new().with_graph_optimization_level(GraphOptimizationLevel::Level1);
-    assert_eq!(
-      opts.graph_optimization_level(),
-      GraphOptimizationLevel::Level1
-    );
+    let opts = Options::new().with_optimization_level(GraphOptimizationLevel::Level1);
+    assert_eq!(opts.optimization_level(), GraphOptimizationLevel::Level1);
   }
 
   #[test]
   fn options_set_round_trips() {
     let mut opts = Options::new();
-    opts.set_graph_optimization_level(GraphOptimizationLevel::Disable);
-    assert_eq!(
-      opts.graph_optimization_level(),
-      GraphOptimizationLevel::Disable
-    );
+    opts.set_optimization_level(GraphOptimizationLevel::Disable);
+    assert_eq!(opts.optimization_level(), GraphOptimizationLevel::Disable);
   }
 
   #[test]

@@ -2,7 +2,7 @@
 name = "textclap"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 description = "Rust ONNX inference library for LAION CLAP-HTSAT-unfused"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Findit-AI/textclap"
@@ -19,23 +19,29 @@ include = [
 ]
 
 [dependencies]
+derive_more = { version = "2", default-features = false, features = ["display", "as_ref", "deref", "deref_mut"] }
 ort        = "2.0.0-rc.12"
 rustfft    = "6"
-tokenizers = "0.20"
+tokenizers = "0.22"
 thiserror  = "2"
+smol_str   = "0.3"
 serde      = { version = "1", features = ["derive"], optional = true }
+serde_with = { version = "3", optional = true }
 
 [dev-dependencies]
-criterion = "0.5"
-rubato    = "0.16"
-npyz      = "0.8"
+criterion = "0.8"
+rubato    = "2"
+npyz      = "0.9"
 hound     = "3"
 
 [features]
 default = []
-serde   = ["dep:serde"]
+serde   = ["dep:serde", "smol_str/serde", "dep:serde_with"]
 
-[lints.rust]
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 rust_2018_idioms      = "warn"
 single_use_lifetimes  = "warn"
 unexpected_cfgs       = { level = "warn", check-cfg = ['cfg(all_tests)', 'cfg(tarpaulin)'] }
