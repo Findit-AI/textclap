@@ -1,6 +1,6 @@
 # textclap — CLAP Inference Library Design
 
-**Status:** Draft (revision 14, post-rev-13 review)
+**Status:** Draft (revision 15, post-rev-14 review — freeze candidate)
 **Date:** 2026-04-25
 **Target version:** 0.1.0
 
@@ -326,10 +326,12 @@ textclap/
 │   ├── error.rs                     # Error enum (thiserror)
 │   ├── options.rs                   # Options, ChunkingOptions; re-exports GraphOptimizationLevel from ort
 │   ├── mel.rs                       # MelExtractor + T_FRAMES const (§8.2)
-│   ├── audio.rs                     # AudioEncoder + AUDIO_INPUT_NAME / AUDIO_OUTPUT_NAME consts (§8.2)
+│   ├── audio.rs                     # AudioEncoder + AUDIO_INPUT_NAME / AUDIO_OUTPUT_NAME /
+│   │                                # AUDIO_OUTPUT_IS_UNIT_NORM consts (§8.2)
 │   ├── text.rs                      # TextEncoder + TEXT_INPUT_IDS_NAME / TEXT_ATTENTION_MASK_NAME /
-│   │                                # (optional) TEXT_POSITION_IDS_NAME / TEXT_OUTPUT_NAME consts (§9.2)
-│   └── clap.rs                      # Clap, Embedding, LabeledScore, LabeledScoreOwned
+│   │                                # (optional) TEXT_POSITION_IDS_NAME / TEXT_OUTPUT_NAME /
+│   │                                # TEXT_OUTPUT_IS_UNIT_NORM consts (§9.2)
+│   └── clap.rs                      # Clap, Embedding, LabeledScore, LabeledScoreOwned + NORM_BUDGET (§7.5)
 ├── tests/
 │   ├── clap_integration.rs          # gated on TEXTCLAP_MODELS_DIR env var
 │   └── fixtures/                    # see §3 for full content
@@ -536,6 +538,8 @@ impl AudioEncoder {
     ///
     /// `AUDIO_OUTPUT_IS_UNIT_NORM` is a compile-time const baked in during
     /// §3.4 step 4. All three AudioEncoder constructors share the same const.
+    /// Regardless of which constructor is used, the resulting `AudioEncoder`
+    /// is `Send` but `!Sync` — thread-per-core deployment applies uniformly.
     pub fn from_ort_session(session: ort::session::Session, opts: Options) -> Result<Self>;
 
     /// Single clip, length 0 < len ≤ 480_000 samples (10 s @ 48 kHz):
@@ -966,9 +970,10 @@ non-empty batch and writes raw model outputs into a caller-provided buffer. **Co
 /// gathers all chunks before aggregation) is a *separate* Vec from the
 /// encoder-owned proj_scratch the helper writes into; the chunked path
 /// copies from proj_scratch into the accumulator after each batch group.
-/// The accumulator is freshly heap-allocated on each embed_chunked call
-/// (~ceil(L/hop) · 2 KB; ~12 KB for 60 s of audio at the default hop).
-/// This is acceptable because embed_chunked is the offline single-clip
+/// The accumulator is freshly heap-allocated on each embed_chunked call:
+/// up to `ceil(L / hop) · 2 KB` total (per the §8.2 allocation budget).
+/// At the default hop = window = 480_000 samples, 60 s of audio → 6 chunks
+/// → ~12 KB. Acceptable because embed_chunked is the offline single-clip
 /// summarization path (§1.2), not the live indexing hot path — the live
 /// path uses embed and the encoder-owned proj_scratch directly.
 pub(crate) fn embed_projections_batched(
@@ -1035,21 +1040,23 @@ for i in 0..n {
    step 4 from `golden_onnx_io.json`) is `true`, construct via the trusted path **with a release-mode
    unit-norm guard**: compute `(‖x‖² − 1).abs()` and return `Error::EmbeddingNotUnitNorm` if it
    exceeds `NORM_BUDGET` (the same 1e-4 budget `try_from_unit_slice` uses; defined once as
-   `pub(crate) const NORM_BUDGET: f32 = 1e-4` in `embedding.rs` and referenced from all four
-   call sites). The guard is ~512 fma + 1 sub + 1 cmp ≈ 200 ns, negligible against ~50 ms ONNX
+   `pub(crate) const NORM_BUDGET: f32 = 1e-4` in `clap.rs` alongside `Embedding`, and referenced
+   from all five call sites — `try_from_unit_slice`, audio `embed`/`embed_batch` trust paths,
+   text `embed`/`embed_batch` trust paths). The guard is ~512 fma + 1 sub + 1 cmp ≈ 200 ns,
+   negligible against ~50 ms ONNX
    inference. It catches the silent-corruption failure mode where a wrongly-baked const (e.g. user
    supplied a different ONNX without rerunning §3.2) would otherwise ship invalid Embeddings to
    lancedb that user `try_from_unit_slice` would later reject on every read-back. Otherwise
    (`AUDIO_OUTPUT_IS_UNIT_NORM == false`) L2-normalize and wrap as `Embedding`.
 
-   **Why 1e-4 and not 1e-6 here.** The realistic failure mode is "wrongly-baked const" — a user
-   supplied a different ONNX export through `from_ort_session` without rerunning §3.2. In that
-   case the model output is not unit-norm at all (norm² is ≫ 1 if the L2-normalize op was
+   **Why 1e-4 and not tighter (e.g. 5e-5).** The realistic failure mode is "wrongly-baked const" —
+   a user supplied a different ONNX export through `from_ort_session` without rerunning §3.2. In
+   that case the model output is not unit-norm at all (norm² is ≫ 1 if the L2-normalize op was
    absent, or some arbitrary value if a different model entirely). 1e-4 catches all such cases by
-   many orders of magnitude. A tighter ~1e-6 guard would be defense-in-depth against a
-   *hypothetical* buggy ORT normalize op producing 1.000005-ish norms — a class that does not
-   exist in the verified Xenova export. Naming consistency with `try_from_unit_slice`
-   (NORM_BUDGET) wins over speculative tightening.
+   many orders of magnitude; a tighter 5e-5 guard wouldn't catch a different bug class, just risk
+   false-positives against legitimate cross-summation-order outputs. Naming consistency with
+   `try_from_unit_slice` (shared `NORM_BUDGET`) wins over speculative tightening; §14 tracks the
+   future-tightening task once telemetry confirms safety.
 
 **`embed_batch(clips)`:**
 1. Empty slice → `Ok(Vec::new())`.
@@ -1231,8 +1238,10 @@ pub enum Error {
     /// direct construction (e.g. read-back from a corrupt lancedb cell).
     /// Field name `component_index` matches the qualified-name convention
     /// used by sibling variants (`clip_index`, `batch_index`, `sample_index`)
-    /// — minor stylistic divergence from soundevents' bare `index`.
-    #[error("embedding contains non-finite component at component_index {component_index}")]
+    /// — minor stylistic divergence from soundevents' bare `index`. The
+    /// error message uses bare "index" to avoid the awkward variant-noun-
+    /// field triple repetition.
+    #[error("embedding contains non-finite component at index {component_index}")]
     NonFiniteEmbedding { component_index: usize },
 
     #[error("embedding norm out of tolerance: |norm² − 1| = {norm_sq_deviation:.3e}")]
@@ -1462,10 +1471,16 @@ sized at ~1.5–2× the worst-case bound for headroom. Use these values when cal
 
 | Comparison                                      | `is_close` (max-abs) | `is_close_cosine` (1−cos) | Origin of cosine value          |
 |-------------------------------------------------|----------------------|----------------------------|---------------------------------|
-| Rust audio embedding vs golden (int8 vs int8)   | 5e-4                 | 1e-4                       | bound 6.4e-5 + ~1.5× headroom    |
+| Rust audio embedding vs golden (int8 vs int8)   | 5e-4                 | 1e-4 *                     | bound 6.4e-5 + ~1.5× headroom    |
 | Rust text embedding vs golden (int8 vs int8)    | 1e-5                 | 5e-8                       | bound 2.6e-8 + ~2× headroom      |
 | Cross-quantization audio (fp32 vs int8 ref)     | 1e-2                 | 5e-2                       | bound 2.6e-2 + ~2× headroom      |
 | Cross-platform reproducibility (CPU EP variance)| 1e-5 (preliminary)   | 5e-8 (preliminary)         | inherited from text-row math; int8-on-MLAS-vs-Accelerate variance has not been measured — widen if real-run measurement supports it |
+
+\* The audio-row cosine value `1e-4` is numerically equal to `NORM_BUDGET` but they measure different
+quantities: the cosine column tests semantic equality `1 − cos(a, b)` between two embeddings via
+`is_close_cosine`, while `NORM_BUDGET` is the per-vector unit-norm tolerance `(‖x‖² − 1).abs()` checked
+inside `try_from_unit_slice` and the §8.2/§9.2 trust-path guards. The numerical coincidence is from
+independent derivations.
 
 Cross-platform reproducibility refers to comparing embeddings produced on different OSes / CPU families
 (e.g. Linux MLAS vs macOS Accelerate, x86 vs ARM). On the *same* OS / hardware / thread / process,
@@ -1640,4 +1655,11 @@ let sim = query.cosine(&stored);
 - **fp16 storage round-trip support.** `try_from_unit_slice` is currently OUT OF SCOPE for fp16 storage
   (fp16's ulp(1.0) ≈ 9.77e-4 exceeds the 1e-4 norm budget); users storing embeddings in fp16 columns must
   use `from_slice_normalizing` on read-back. A future variant `try_from_unit_slice_fp16` (with a relaxed
-  ~5e-3 budget) would let users opt into "I know it came through fp16, don't normalize again" semantics.
+  ~3e-2 budget — derived from worst-case fp16 round-trip drift `Δ(‖x‖²) ≈ 2·δ·√dim = 2·5e-4·√512 ≈ 2.3e-2`,
+  rounded up with margin; revisit when the dimension changes) would let users opt into "I know it came
+  through fp16, don't normalize again" semantics.
+- **Tighten `NORM_BUDGET` from 1e-4 to 5e-5** once first-run BLAS-variation telemetry confirms safety.
+  The §7.5 rationale explains the asymmetric-rollback argument for shipping at 1e-4: rolling back to
+  5e-5 if measurement supports it is a low-stakes spec edit, while rolling forward from a 5e-5
+  production failure would be a higher-stakes patch. Tracking it here makes the future tightening a
+  registered task rather than an inline comment.
