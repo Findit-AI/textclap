@@ -147,9 +147,38 @@ impl AudioEncoder {
     Self::finalize_embedding(row)
   }
 
-  /// Embed N clips of arbitrary length 1..=480_000 each.
-  pub fn embed_batch(&mut self, _clips: &[&[f32]]) -> Result<Vec<Embedding>> {
-    unimplemented!("AudioEncoder::embed_batch — implemented in Task 20")
+  /// Batch of clips of any lengths in 0 < len ≤ 480 000. See spec §7.3 / §8.2.
+  pub fn embed_batch(&mut self, clips: &[&[f32]]) -> Result<Vec<Embedding>> {
+    if clips.is_empty() {
+      return Ok(Vec::new());
+    }
+
+    // Per-clip validation.
+    for (i, clip) in clips.iter().enumerate() {
+      if clip.is_empty() {
+        return Err(Error::EmptyAudio { clip_index: Some(i) });
+      }
+      if clip.len() > TARGET_SAMPLES {
+        return Err(Error::AudioTooLong {
+          got: clip.len(),
+          max: TARGET_SAMPLES,
+        });
+      }
+      if let Some(sample_index) = Self::first_non_finite(clip) {
+        return Err(Error::NonFiniteAudio {
+          clip_index: Some(i),
+          sample_index,
+        });
+      }
+    }
+
+    let mut raw = Vec::with_capacity(clips.len());
+    self.embed_projections_batched(clips, &mut raw)?;
+    let mut out = Vec::with_capacity(raw.len());
+    for row in raw {
+      out.push(Self::finalize_embedding(row)?);
+    }
+    Ok(out)
   }
 
   /// Embed an arbitrary-length clip via textclap's chunking. NOT LAION-reference compatible.
