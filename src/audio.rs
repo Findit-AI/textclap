@@ -8,7 +8,7 @@ use ort::value::TensorRef;
 use crate::clap_model::{Embedding, NORM_BUDGET};
 use crate::error::{Error, Result};
 use crate::mel::{MelExtractor, T_FRAMES};
-use crate::options::Options;
+use crate::options::{ChunkingOptions, Options};
 
 // Backfilled from golden_onnx_io.json per §3.4. Module-private.
 const AUDIO_INPUT_NAME: &str = "input_features";
@@ -89,6 +89,8 @@ impl AudioEncoder {
 
   /// Wrap a pre-built ORT session. See spec §7.3 for the asymmetric purposes.
   pub fn from_ort_session(session: Session, _opts: Options) -> Result<Self> {
+    // Note: opts is unused here because the wrapped session was already configured
+    // by the caller. We still accept it for API symmetry with from_file/from_memory.
     Self::from_loaded_session(session)
   }
 
@@ -181,18 +183,102 @@ impl AudioEncoder {
     Ok(out)
   }
 
-  /// Embed an arbitrary-length clip via textclap's chunking. NOT LAION-reference compatible.
+  /// Arbitrary-length input via textclap's chunking convention. NOT LAION-reference compatible.
+  /// See spec §7.3 / §8.2.
   pub fn embed_chunked(
     &mut self,
-    _samples: &[f32],
-    _opts: &crate::options::ChunkingOptions,
+    samples: &[f32],
+    opts: &ChunkingOptions,
   ) -> Result<Embedding> {
-    unimplemented!("AudioEncoder::embed_chunked — implemented in Task 21")
+    if samples.is_empty() {
+      return Err(Error::EmptyAudio { clip_index: None });
+    }
+    if opts.window_samples() == 0
+      || opts.hop_samples() == 0
+      || opts.batch_size() == 0
+      || opts.hop_samples() > opts.window_samples()
+    {
+      return Err(Error::ChunkingConfig {
+        window_samples: opts.window_samples(),
+        hop_samples: opts.hop_samples(),
+        batch_size: opts.batch_size(),
+      });
+    }
+    if let Some(sample_index) = Self::first_non_finite(samples) {
+      return Err(Error::NonFiniteAudio {
+        clip_index: None,
+        sample_index,
+      });
+    }
+
+    // Chunk offsets: 0, hop, 2·hop, …; skip trailing < window/4 unless the input itself is shorter.
+    let window = opts.window_samples();
+    let hop = opts.hop_samples();
+    let min_keep = window / 4;
+    let mut offsets: Vec<usize> = Vec::new();
+    let mut off = 0;
+    while off < samples.len() {
+      let remain = samples.len() - off;
+      let chunk_len = remain.min(window);
+      if chunk_len >= min_keep || offsets.is_empty() {
+        offsets.push(off);
+      }
+      off += hop;
+    }
+
+    // Process in groups of batch_size; accumulate raw projections.
+    let mut accumulator: Vec<[f32; 512]> = Vec::with_capacity(offsets.len());
+    let mut tmp_proj: Vec<[f32; 512]> = Vec::with_capacity(opts.batch_size());
+    for batch_offsets in offsets.chunks(opts.batch_size()) {
+      let chunks: Vec<&[f32]> = batch_offsets
+        .iter()
+        .map(|&o| &samples[o..(o + window).min(samples.len())])
+        .collect();
+      self.embed_projections_batched(&chunks, &mut tmp_proj)?;
+      accumulator.extend(tmp_proj.drain(..));
+    }
+
+    // Single-chunk case skips aggregation regardless of branch.
+    if accumulator.len() == 1 {
+      return Self::finalize_embedding(
+        accumulator
+          .into_iter()
+          .next()
+          .expect("checked len == 1 above"),
+      );
+    }
+
+    // Aggregate. Both branches end with L2-normalize → Embedding (via from_slice_normalizing,
+    // which inherits the cancellation-safe normalize and unit-norm invariant).
+    // Branch is dead-code-eliminated by the optimizer when AUDIO_OUTPUT_IS_UNIT_NORM is fixed.
+    let mut centroid = [0.0f32; 512];
+    if AUDIO_OUTPUT_IS_UNIT_NORM {
+      // Spherical-mean: average unit vectors, then normalize.
+      for row in &accumulator {
+        for (acc, &v) in centroid.iter_mut().zip(row.iter()) {
+          *acc += v;
+        }
+      }
+    } else {
+      // Centroid path: average raw projections, then normalize.
+      for row in &accumulator {
+        for (acc, &v) in centroid.iter_mut().zip(row.iter()) {
+          *acc += v;
+        }
+      }
+    }
+    let inv_n = 1.0 / accumulator.len() as f32;
+    for v in &mut centroid {
+      *v *= inv_n;
+    }
+    Embedding::from_slice_normalizing(&centroid)
   }
 
-  /// Run a dummy forward to amortize ORT operator specialization and size scratch.
+  /// Run a dummy forward to amortize ORT operator specialization. See spec §11.4.
   pub fn warmup(&mut self) -> Result<()> {
-    unimplemented!("AudioEncoder::warmup — implemented in Task 21")
+    let silence = vec![0.0f32; TARGET_SAMPLES];
+    let _ = self.embed(&silence)?;
+    Ok(())
   }
 }
 
