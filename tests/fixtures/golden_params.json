@@ -1,0 +1,26 @@
+{
+  "sampling_rate": 48000,
+  "feature_size": 64,
+  "fft_window_size": 1024,
+  "hop_length": 480,
+  "max_length_s": 10.0,
+  "mel_scale": "slaney",
+  "filterbank_norm": "slaney",
+  "amin": 1e-10,
+  "ref": 1.0,
+  "top_db": null,
+  "frequency_min": 50.0,
+  "frequency_max": 14000.0,
+  "padding_mode": "repeatpad",
+  "truncation_mode": "rand_trunc",
+  "T_frames": 1001,
+  "htsat_input_normalization": {
+    "type": "none",
+    "mean": null,
+    "std": null
+  },
+  "htsat_norm_drift": 0.011024915613234043,
+  "warmup_text": "the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog ",
+  "warmup_text_token_count": 84,
+  "warmup_text_repetitions": 9
+}
