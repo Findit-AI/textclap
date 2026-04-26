@@ -5,10 +5,24 @@
 //! 1.10e-2 in the yellow zone — see `golden_params.json["htsat_norm_drift"]`); the optional
 //! `HTSAT_INPUT_MEAN` / `HTSAT_INPUT_STD` constants stay commented out.
 
+use std::sync::Arc;
+
+use rustfft::num_complex::Complex32;
+use rustfft::{Fft, FftPlanner};
+
 use crate::error::Result;
 
 /// Mel time-frame count. Backfilled from `golden_params.json["T_frames"]` per §3.4.
 pub(crate) const T_FRAMES: usize = 1001;
+
+const N_FFT: usize = 1024;
+const HOP: usize = 480;
+const N_MELS: usize = 64;
+const SR: u32 = 48_000;
+const TARGET_SAMPLES: usize = 480_000;
+const FMIN: f32 = 50.0;
+const FMAX: f32 = 14_000.0;
+const POWER_TO_DB_AMIN: f32 = 1e-10;
 
 // Optional HTSAT input-normalization constants. Defined only if §3.2's functional check chose
 // `global_mean_std`; otherwise mel.rs has no normalization step.
@@ -18,7 +32,9 @@ pub(crate) const T_FRAMES: usize = 1001;
 
 /// Mel-spectrogram extractor. Owns the Hann window, mel filterbank, and FFT planner.
 pub(crate) struct MelExtractor {
-  // Real fields land in Task 13–16.
+  window: Vec<f32>,       // length N_FFT
+  filterbank: Vec<f32>,   // length N_MELS × (N_FFT/2 + 1)
+  fft: Arc<dyn Fft<f32>>, // FftPlanner output for N_FFT
 }
 
 impl MelExtractor {
@@ -107,7 +123,34 @@ impl MelExtractor {
   }
 
   pub(crate) fn new() -> Self {
-    unimplemented!("MelExtractor::new — implemented in Phase C")
+    let window = Self::periodic_hann(N_FFT);
+    let filterbank = Self::build_mel_filterbank(SR, N_FFT, N_MELS, FMIN, FMAX);
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(N_FFT);
+    Self {
+      window,
+      filterbank,
+      fft,
+    }
+  }
+
+  /// Compute |X[k]|² for a single Hann-windowed frame of length N_FFT.
+  /// `power` must have length N_FFT/2 + 1 = 513.
+  fn stft_one_frame_power(&self, frame: &[f32], power: &mut [f32]) {
+    debug_assert_eq!(frame.len(), N_FFT);
+    debug_assert_eq!(power.len(), N_FFT / 2 + 1);
+    // Window the frame, build a Complex32 buffer, run a full complex FFT, then take the
+    // first N_FFT/2 + 1 bins (real-FFT identity).
+    let mut buf: Vec<Complex32> = frame
+      .iter()
+      .zip(self.window.iter())
+      .map(|(&s, &w)| Complex32::new(s * w, 0.0))
+      .collect();
+    self.fft.process(&mut buf);
+    for k in 0..(N_FFT / 2 + 1) {
+      let c = buf[k];
+      power[k] = c.re * c.re + c.im * c.im;
+    }
   }
 
   /// Compute mel features and write into `out`. Caller must size `out` to exactly `T_FRAMES * 64`
@@ -206,5 +249,30 @@ mod tests {
         "filterbank row {row_idx} max_abs_diff = {max_diff:.3e}",
       );
     }
+  }
+
+  /// Hann-windowed STFT of a 1 kHz sine wave at 48 kHz should peak at the bin closest to
+  /// k = 1000 / (48000 / 1024) = 21.33 → bin 21 (or 22).
+  #[test]
+  fn stft_peaks_at_expected_bin() {
+    let mel = MelExtractor::new();
+    let sr = 48000_f32;
+    let freq = 1000.0_f32;
+    let mut samples = Vec::with_capacity(1024);
+    for k in 0..1024 {
+      samples.push((2.0 * std::f32::consts::PI * freq * (k as f32) / sr).sin());
+    }
+    let mut power = vec![0.0f32; 513];
+    mel.stft_one_frame_power(&samples, &mut power);
+    // Find peak bin
+    let (peak_bin, _) = power
+      .iter()
+      .enumerate()
+      .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+      .unwrap();
+    assert!(
+      peak_bin == 21 || peak_bin == 22,
+      "expected peak at bin 21 or 22, got bin {peak_bin}",
+    );
   }
 }
