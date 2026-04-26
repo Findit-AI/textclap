@@ -1,8 +1,12 @@
 //! Top-level Clap, Embedding, LabeledScore types. See spec §7.2 / §7.5 / §7.6.
 
 use std::fmt;
+use std::path::Path;
 
+use crate::audio::AudioEncoder;
 use crate::error::{Error, Result};
+use crate::options::{ChunkingOptions, Options};
+use crate::text::TextEncoder;
 
 // Future-`Clap` / `LabeledScore[Owned]` types land in Task 11 + Task 25; this commit only adds
 // `Embedding` + `NORM_BUDGET` so audio.rs / text.rs (added in Task 12) can reference them.
@@ -225,6 +229,79 @@ impl LabeledScoreOwned {
     /// Consume self, returning the owned label.
     pub fn into_label(self) -> String {
         self.label
+    }
+}
+
+/// Top-level CLAP handle wrapping audio + text encoders. See spec §7.2.
+pub struct Clap {
+    audio: AudioEncoder,
+    text: TextEncoder,
+}
+
+impl Clap {
+    /// Load from three file paths.
+    pub fn from_files<P: AsRef<Path>>(
+        _audio_onnx: P,
+        _text_onnx: P,
+        _tokenizer_json: P,
+        _opts: Options,
+    ) -> Result<Self> {
+        unimplemented!("Clap::from_files — implemented in Task 25/26")
+    }
+
+    /// Load from caller-supplied bytes.
+    pub fn from_memory(
+        _audio_bytes: &[u8],
+        _text_bytes: &[u8],
+        _tokenizer_bytes: &[u8],
+        _opts: Options,
+    ) -> Result<Self> {
+        unimplemented!("Clap::from_memory — implemented in Task 26")
+    }
+
+    /// Mutable access to the audio encoder.
+    pub fn audio_mut(&mut self) -> &mut AudioEncoder {
+        &mut self.audio
+    }
+
+    /// Mutable access to the text encoder.
+    pub fn text_mut(&mut self) -> &mut TextEncoder {
+        &mut self.text
+    }
+
+    /// Warm up both encoders.
+    pub fn warmup(&mut self) -> Result<()> {
+        unimplemented!("Clap::warmup — implemented in Task 26")
+    }
+
+    /// Top-k zero-shot classification.
+    pub fn classify<'a>(
+        &mut self,
+        _samples: &[f32],
+        _labels: &'a [&str],
+        _k: usize,
+    ) -> Result<Vec<LabeledScore<'a>>> {
+        unimplemented!("Clap::classify — implemented in Task 27")
+    }
+
+    /// All-labels zero-shot classification.
+    pub fn classify_all<'a>(
+        &mut self,
+        _samples: &[f32],
+        _labels: &'a [&str],
+    ) -> Result<Vec<LabeledScore<'a>>> {
+        unimplemented!("Clap::classify_all — implemented in Task 27")
+    }
+
+    /// Long-clip zero-shot classification (NOT LAION-reference compatible — see spec §7.3).
+    pub fn classify_chunked<'a>(
+        &mut self,
+        _samples: &[f32],
+        _labels: &'a [&str],
+        _k: usize,
+        _opts: &ChunkingOptions,
+    ) -> Result<Vec<LabeledScore<'a>>> {
+        unimplemented!("Clap::classify_chunked — implemented in Task 27")
     }
 }
 
