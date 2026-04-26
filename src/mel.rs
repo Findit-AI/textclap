@@ -17,16 +17,16 @@ pub(crate) const T_FRAMES: usize = 1000; // PLACEHOLDER — replace with golden_
 
 /// Mel-spectrogram extractor. Owns the Hann window, mel filterbank, and FFT planner.
 pub(crate) struct MelExtractor {
-    // Real fields land in Task 13–16.
+  // Real fields land in Task 13–16.
 }
 
 impl MelExtractor {
-    pub(crate) fn new() -> Self {
-        unimplemented!("MelExtractor::new — implemented in Phase C")
-    }
+  pub(crate) fn new() -> Self {
+    unimplemented!("MelExtractor::new — implemented in Phase C")
+  }
 
-    /// Compute mel features and write into `out`. Caller must size `out` to exactly `64 * T_FRAMES`.
-    pub(crate) fn extract_into(&mut self, _samples: &[f32], _out: &mut [f32]) -> Result<()> {
-        unimplemented!("MelExtractor::extract_into — implemented in Phase C")
-    }
+  /// Compute mel features and write into `out`. Caller must size `out` to exactly `64 * T_FRAMES`.
+  pub(crate) fn extract_into(&mut self, _samples: &[f32], _out: &mut [f32]) -> Result<()> {
+    unimplemented!("MelExtractor::extract_into — implemented in Phase C")
+  }
 }
