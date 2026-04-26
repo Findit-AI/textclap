@@ -1,6 +1,6 @@
 # textclap — CLAP Inference Library Design
 
-**Status:** Approved (revision 16, freeze-ready post-rev-15 polish)
+**Status:** Approved (revision 17, Phase A backfill applied — fixture-derived values land in §8.1 / §8.2 / §9.2 / §11.4)
 **Date:** 2026-04-25
 **Target version:** 0.1.0
 
@@ -154,7 +154,8 @@ versions in a header comment):
      resulting `pangram * k` string is recorded as `warmup_text` in `golden_params.json` along with the
      measured token count. This is reproducible across maintainers — no hand iteration. The literal
      string is what `Clap::warmup` feeds to the text encoder (§11.4).
-3. Runs the extractor; saves resulting `[64, T]` mel features to `golden_mel.npy`.
+3. Runs the extractor; saves resulting `[T, 64]` mel features to `golden_mel.npy` (time-major
+   layout: one row per frame, 64 mel values per row).
 4. **Audio model golden.** Loads `audio_model_quantized.onnx` via `onnxruntime.InferenceSession`; runs it
    on the golden mel features. Computes the L2-normalized embedding using the *exact* formula
    ```python
@@ -180,7 +181,7 @@ quantization drift *and* implementation differences, indistinguishably.
 dynamic dims marked) and the first/last 20 graph nodes into `tests/fixtures/golden_onnx_io.json`. From this
 file the spec answers:
 
-- **Audio input shape:** `[batch, 1, 64, T]` *vs* `[batch, 64, T]` (channel dim present?).
+- **Audio input shape:** `[batch, 1, T, 64]` *vs* `[batch, T, 64]` (channel dim present?).
 - **Audio output L2-normalize?** Examine the last 5 graph nodes for an `LpNormalization` op (axis=-1, p=2)
   or the equivalent `ReduceL2` + `Div` pattern. Record `audio_output_is_unit_norm: true|false`.
 - **Text input names and dtypes:** `input_ids: [batch, T] i64`, `attention_mask: [batch, T] i64`, plus
@@ -330,9 +331,9 @@ textclap/
 │   ├── mel.rs                       # MelExtractor + T_FRAMES const (§8.2)
 │   ├── audio.rs                     # AudioEncoder + AUDIO_INPUT_NAME / AUDIO_OUTPUT_NAME /
 │   │                                # AUDIO_OUTPUT_IS_UNIT_NORM consts (§8.2)
-│   ├── text.rs                      # TextEncoder + TEXT_INPUT_IDS_NAME / TEXT_ATTENTION_MASK_NAME /
-│   │                                # (optional) TEXT_POSITION_IDS_NAME / TEXT_OUTPUT_NAME /
-│   │                                # TEXT_OUTPUT_IS_UNIT_NORM consts (§9.2)
+│   ├── text.rs                      # TextEncoder + TEXT_INPUT_IDS_NAME / TEXT_OUTPUT_NAME /
+│   │                                # TEXT_OUTPUT_IS_UNIT_NORM consts (§9.2; attention_mask and
+│   │                                # position_ids are inlined into the ONNX graph, not externalized)
 │   └── clap.rs                      # Clap, Embedding, LabeledScore, LabeledScoreOwned + NORM_BUDGET (§7.5)
 ├── tests/
 │   ├── clap_integration.rs          # gated on TEXTCLAP_MODELS_DIR env var
@@ -708,6 +709,12 @@ inlined into Xenova's ONNX export. If §3.2 finds `position_ids` as an externali
 computes it explicitly using the resolved `pad_id` (§9.1) — *not* the literal `1` — and feeds it as a
 third tensor.
 
+**The Xenova `clap-htsat-unfused` export takes only `input_ids` as an external input** — RoBERTa's
+attention masking and position-id derivation are inlined into the graph (using `pad_id=1` internally).
+The tokenizer still needs `pad_id` for `BatchLongest` padding so `encode_batch` produces uniform
+sequence lengths, but no `attention_mask` or `position_ids` tensor is sent to the model. If a future
+export externalizes either, regenerate `golden_onnx_io.json` and update §9.2 accordingly.
+
 ### 7.5 `Embedding`
 
 ```rust
@@ -906,8 +913,8 @@ impl MelExtractor {
     pub(crate) fn new() -> Self;
 
     /// Compute mel features and write into `out`. Caller must size `out` to
-    /// exactly `64 * T` (T from golden_params.json). Asserts on length
-    /// mismatch.
+    /// exactly `T * 64` (T from golden_params.json; time-major layout: one row
+    /// per frame, 64 mel values per row). Asserts on length mismatch.
     pub(crate) fn extract_into(&mut self, samples: &[f32], out: &mut [f32]) -> Result<()>;
 }
 ```
@@ -916,8 +923,8 @@ The `&mut [f32]` interface (rather than `&mut Vec<f32>`) is what enables the §7
 `AudioEncoder` resizes its scratch `Vec` once per call, then hands the extractor sub-slices for each
 batch row.
 
-Parameters (subject to §3.1 verification — values in this table are *expected*; recorded values in
-`golden_params.json` are authoritative; only the truncation row is intentionally chosen differently):
+Parameters (recorded values from `golden_params.json` per §3.1; only the truncation row is intentionally
+chosen differently from HF's `rand_trunc`):
 
 | Parameter            | Value                                             |
 |----------------------|---------------------------------------------------|
@@ -926,25 +933,30 @@ Parameters (subject to §3.1 verification — values in this table are *expected
 | `n_fft`              | 1024                                              |
 | Hop length           | 480                                               |
 | Window               | **Hann, periodic, length 1024**                   |
-| Frame count `T`      | **TBD by §3.1**                                   |
+| Frame count `T`      | **1001** (HF extractor uses center=True padding)  |
 | Mel bins             | 64                                                |
 | Mel scale            | **Slaney**                                        |
 | Filterbank norm      | **Slaney**                                        |
 | Frequency range      | 50 – 14 000 Hz                                    |
 | Power spectrum       | `|X|²`                                            |
-| Mel→dB transform     | **`10 · log10(max(amin, x))` with `amin = 1e-10`, `ref = 1.0`, `top_db = TBD by §3.1`; applied exactly once after the mel filterbank** |
+| Mel→dB transform     | **`10 · log10(max(amin, x))` with `amin = 1e-10`, `ref = 1.0`, `top_db = null` (no clipping); applied exactly once after the mel filterbank** |
 | Padding mode         | repeatpad                                         |
 | Truncation mode      | head (deterministic; intentionally differs from HF rand_trunc) |
-| HTSAT input norm     | **TBD by §3.2 functional check**                  |
+| HTSAT input norm     | **none** (functional verification at maintenance time chose 'none' with drift 1.10e-2 in yellow zone — see `golden_params.json["htsat_norm_drift"]`) |
 
 State allocated once in `new()`, owned by the `MelExtractor`:
 - Hann window (`Vec<f32>`, len 1024, periodic convention).
 - Mel filterbank (`Vec<f32>`, len 64 × 513).
 - `RealFftPlanner<f32>` instance.
 
-The ONNX input tensor shape `[N, 1, 64, T]` is built as a *view* over the mel feature scratch — the channel
+The ONNX input tensor shape `[N, 1, T, 64]` is built as a *view* over the mel feature scratch — the channel
 dim is added at tensor-construction time with no data movement, and the underlying `Vec<f32>` length
-stays `N · 64 · T`.
+stays `N · T · 64`.
+
+**Layout note.** The HF `ClapFeatureExtractor` produces time-major `[T, 64]` layout. mel.rs writes one
+row per frame (64 mel values per row); the ONNX audio model's `[batch, 1, T, 64]` input matches this
+directly. Output buffer shape matches `T` from `golden_params.json` — only the axis order is
+time-major (frames are the outer dimension, mel bins inner).
 
 #### 8.1.1 Filterbank-correctness unit test
 
@@ -968,7 +980,7 @@ Separate unit test asserts that `MelExtractor::extract_into` differs visibly fro
 // them as Rust constants in audio.rs. Module-private (matches silero
 // session.rs:12) — referenced only inside audio.rs.
 const AUDIO_INPUT_NAME:  &str = "input_features";
-const AUDIO_OUTPUT_NAME: &str = "audio_embeds";   // example; verify via §3.2
+const AUDIO_OUTPUT_NAME: &str = "audio_embeds";
 ```
 
 `T` (the mel time dimension, recorded in `golden_params.json` per §3.1) is a `pub(crate) const T_FRAMES`
@@ -1018,7 +1030,7 @@ form for `TensorRef::from_array_view`, and `try_extract_tensor` not `try_extract
 use ort::value::TensorRef;
 
 let n = clips.len();
-let row_len = 64 * T_FRAMES;                                       // compile-time const after §3.4
+let row_len = T_FRAMES * 64;                                       // compile-time const after §3.4
 let total = n * row_len;
 
 self.mel_scratch.clear();
@@ -1037,7 +1049,7 @@ for (i, clip) in clips.iter().enumerate() {
 }
 
 let input = TensorRef::from_array_view((
-    [n, 1usize, 64, T_FRAMES],                                     // shape: tuple of usize, NOT &[i64]
+    [n, 1usize, T_FRAMES, 64],                                     // shape: tuple of usize, NOT &[i64]
     self.mel_scratch.as_slice(),                                   // data: &[f32]
 ))?;
 
@@ -1146,16 +1158,16 @@ Loaded once at construction. textclap inspects the tokenizer to cache:
 
 ### 9.2 `TextEncoder` orchestration
 
-> §3.2 backfill: tensor names and dtypes (`input_ids`, `attention_mask`, possibly `position_ids`)
-> confirmed by `inspect_onnx.py` before §3.4 step 3.
+> §3.2 backfill: tensor names and dtypes (`input_ids` only — `attention_mask` and `position_ids`
+> are inlined into the graph, not externalized) confirmed by `inspect_onnx.py` before §3.4 step 3.
 
 ```rust
 // Backfilled per §3.4: step 3 lands these names in this spec; step 4 lands
 // them as Rust constants in text.rs. Module-private (matches silero convention).
-const TEXT_INPUT_IDS_NAME:      &str = "input_ids";
-const TEXT_ATTENTION_MASK_NAME: &str = "attention_mask";
-const TEXT_POSITION_IDS_NAME:   &str = "position_ids";   // referenced only if §3.2 found this input
-const TEXT_OUTPUT_NAME:         &str = "text_embeds";    // example; verify via §3.2
+// The Xenova clap-htsat-unfused export inlines attention_mask and position_ids
+// derivation into the graph; only input_ids is externalized. See §7.4.
+const TEXT_INPUT_IDS_NAME: &str = "input_ids";
+const TEXT_OUTPUT_NAME:    &str = "text_embeds";
 ```
 
 §7.3.1 scratch-lifecycle contract applies. ORT output extraction uses `try_extract_tensor::<f32>()` and
@@ -1164,12 +1176,11 @@ const TEXT_OUTPUT_NAME:         &str = "text_embeds";    // example; verify via 
 **`embed(text)`:**
 1. `text.is_empty()` → `Error::EmptyInput { batch_index: None }`.
 2. `tokenizer.encode(text, add_special_tokens=true)` → `Encoding`.
-3. `ids: Vec<i64>` — clear → reserve(T) → extend_from_slice from cast u32 ids. Same for `mask: Vec<i64>`.
-4. If §3.2 says `position_ids` is externalized: clear/reserve/extend `pos: Vec<i64>` computed from `mask`
-   and the resolved `pad_id`.
-5. Bind tensor views via `TensorRef::from_array_view(([1usize, t], ids.as_slice()))?` for each input
-   tensor; run; validate output shape `[1, 512]` via the §7.3.1 helper; copy out; drop views.
-6. If `TEXT_OUTPUT_IS_UNIT_NORM` (§7.1, compile-time const) is `true`, construct via the trusted path
+3. `ids: Vec<i64>` — clear → reserve(T) → extend_from_slice from cast u32 ids.
+4. Bind a single tensor view via `TensorRef::from_array_view(([1usize, t], ids.as_slice()))?`; run with
+   `ort::inputs![TEXT_INPUT_IDS_NAME => input_ids_view]`; validate output shape `[1, 512]` via the §7.3.1
+   helper; copy out; drop view.
+5. If `TEXT_OUTPUT_IS_UNIT_NORM` (§7.1, compile-time const) is `true`, construct via the trusted path
    with the release-mode unit-norm guard (`NORM_BUDGET = 1e-4`; same rationale as the audio-side guard
    at §8.2 step 5); otherwise L2-normalize → `Embedding`.
 
@@ -1177,8 +1188,9 @@ const TEXT_OUTPUT_NAME:         &str = "text_embeds";    // example; verify via 
 1. Empty slice → `Ok(Vec::new())`.
 2. For each `texts[i]`: empty → `Error::EmptyInput { batch_index: Some(i) }`.
 3. `tokenizer.encode_batch(texts)` → all encodings already padded to `T_max` (BatchLongest applied per §9.1).
-4. Resize encoder-owned ids/mask scratch via clear/reserve/resize to `[N × T_max]`; copy in-place.
-5. Bind tensor views, run, validate output shape `[N, 512]`, copy out, drop views.
+4. Resize encoder-owned ids scratch via clear/reserve/resize to `[N × T_max]`; copy in-place.
+5. Bind a single tensor view, run with `ort::inputs![TEXT_INPUT_IDS_NAME => input_ids_view]`, validate
+   output shape `[N, 512]`, copy out, drop view.
 6. Row-by-row construct `Embedding`s — same branch as single-clip `embed`: if `TEXT_OUTPUT_IS_UNIT_NORM`
    is `true`, use the trusted path with the release-mode unit-norm guard (`NORM_BUDGET`, same rationale
    as the audio side); otherwise L2-normalize each row.
@@ -1350,6 +1362,13 @@ real call. The script measures the actual post-tokenizer count via the `tokenize
 records the chosen string (and its measured token count) as `warmup_text` in `golden_params.json`. The
 algorithm is deterministic: smallest integer `k` such that `pangram * k` yields ≥80 BPE tokens. No hand
 iteration; reproducible across maintainers.
+
+**Recorded `warmup_text`** (from `golden_params.json`; 84 BPE tokens — 9 repetitions of
+`"the quick brown fox jumps over the lazy dog "` including the trailing space):
+
+```
+the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog 
+```
 
 **`warmup_text` drift caveat.** The script measures token count using its generation-time `tokenizers`
 Python package against the bundled `tokenizer.json`. If a downstream user supplies a non-default
@@ -1682,7 +1701,7 @@ let sim = query.cosine(&stored);
 - `tracing` feature for service-tier observability.
 - `try_reserve_exact` on scratch resizes to surface OOM as `Error::ScratchAlloc` instead of panic.
 - `Options::with_truncation_warn_threshold(usize)` to log when text inputs hit the silent truncation cap.
-- **Pre-allocation of scratch to a fixed `MAX_BATCH × 64 × T` at construction**, eliminating the
+- **Pre-allocation of scratch to a fixed `MAX_BATCH × T × 64` at construction**, eliminating the
   resize-during-inference class structurally instead of relying on the §7.3.1 borrow-checker pattern.
   Trade: API rigidity. Adopt if profiling or fuzz-style stress testing surfaces resize-related issues.
 - **In-flight cancellation.** ORT 2.x exposes `RunOptions::new()?` and `Arc<RunOptions>::terminate()`.

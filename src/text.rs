@@ -5,13 +5,12 @@ use std::path::Path;
 use crate::{clap_model::Embedding, error::Result, options::Options};
 
 // Backfilled from golden_onnx_io.json per §3.4. Module-private.
-const TEXT_INPUT_IDS_NAME: &str = "input_ids"; // PLACEHOLDER
-const TEXT_ATTENTION_MASK_NAME: &str = "attention_mask"; // PLACEHOLDER
-// `TEXT_POSITION_IDS_NAME` exists only if §3.2 found position_ids as an external input.
-// const TEXT_POSITION_IDS_NAME: &str = "position_ids";
-const TEXT_OUTPUT_NAME: &str = "text_embeds"; // PLACEHOLDER
+// The Xenova clap-htsat-unfused export inlines attention_mask and position_ids derivation
+// into the graph; only input_ids is externalized. See spec §7.4 / §9.2.
+const TEXT_INPUT_IDS_NAME: &str = "input_ids";
+const TEXT_OUTPUT_NAME: &str = "text_embeds";
 
-const TEXT_OUTPUT_IS_UNIT_NORM: bool = false; // PLACEHOLDER
+const TEXT_OUTPUT_IS_UNIT_NORM: bool = false;
 
 /// Text encoder. See spec §7.4.
 pub struct TextEncoder {

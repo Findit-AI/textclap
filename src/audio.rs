@@ -5,12 +5,12 @@ use std::path::Path;
 use crate::{clap_model::Embedding, error::Result, options::Options};
 
 // Backfilled from golden_onnx_io.json per §3.4. Module-private.
-const AUDIO_INPUT_NAME: &str = "input_features"; // PLACEHOLDER
-const AUDIO_OUTPUT_NAME: &str = "audio_embeds"; // PLACEHOLDER
+const AUDIO_INPUT_NAME: &str = "input_features";
+const AUDIO_OUTPUT_NAME: &str = "audio_embeds";
 
 /// Compile-time const indicating whether the audio ONNX output is already L2-normalized.
 /// Backfilled from `golden_onnx_io.json["audio_output_is_unit_norm"]` per §3.4.
-const AUDIO_OUTPUT_IS_UNIT_NORM: bool = false; // PLACEHOLDER
+const AUDIO_OUTPUT_IS_UNIT_NORM: bool = false;
 
 /// Audio encoder. See spec §7.3.
 pub struct AudioEncoder {

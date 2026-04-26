@@ -1,13 +1,14 @@
 //! Mel-spectrogram extractor (private to the crate). See spec §8.1 for the full pipeline.
 //!
-//! `T_FRAMES` and (optional) `HTSAT_INPUT_MEAN` / `HTSAT_INPUT_STD` are backfilled from
-//! `golden_params.json` per §3.4 step 3 → step 4. The skeleton uses placeholder values that
-//! Phase C replaces.
+//! `T_FRAMES` is backfilled from `golden_params.json["T_frames"]` per §3.4. HTSAT input
+//! normalization is `none` for this export (functional verification chose 'none' with drift
+//! 1.10e-2 in the yellow zone — see `golden_params.json["htsat_norm_drift"]`); the optional
+//! `HTSAT_INPUT_MEAN` / `HTSAT_INPUT_STD` constants stay commented out.
 
 use crate::error::Result;
 
 /// Mel time-frame count. Backfilled from `golden_params.json["T_frames"]` per §3.4.
-pub(crate) const T_FRAMES: usize = 1000; // PLACEHOLDER — replace with golden_params.json["T_frames"] in Task 6
+pub(crate) const T_FRAMES: usize = 1001;
 
 // Optional HTSAT input-normalization constants. Defined only if §3.2's functional check chose
 // `global_mean_std`; otherwise mel.rs has no normalization step.
@@ -25,7 +26,8 @@ impl MelExtractor {
     unimplemented!("MelExtractor::new — implemented in Phase C")
   }
 
-  /// Compute mel features and write into `out`. Caller must size `out` to exactly `64 * T_FRAMES`.
+  /// Compute mel features and write into `out`. Caller must size `out` to exactly `T_FRAMES * 64`
+  /// (time-major layout: one row per frame, 64 mel values per row).
   pub(crate) fn extract_into(&mut self, _samples: &[f32], _out: &mut [f32]) -> Result<()> {
     unimplemented!("MelExtractor::extract_into — implemented in Phase C")
   }
