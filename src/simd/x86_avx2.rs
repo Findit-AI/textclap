@@ -8,9 +8,8 @@
 //! feature set. Same `#[target_feature]` placement and `#[inline]`
 //! policy as `colconv::row::arch::x86_avx2`.
 //!
-//! `mel_filterbank_dot` and `first_non_finite` remain placeholder
-//! forwarders to [`super::scalar`] until Tasks SIMD-3 / SIMD-4 fill in
-//! their intrinsics.
+//! `first_non_finite` remains a placeholder forwarder to
+//! [`super::scalar`] until Task SIMD-4 fills in its intrinsics.
 
 use core::arch::x86_64::*;
 use rustfft::num_complex::Complex;
@@ -80,7 +79,30 @@ pub(crate) unsafe fn power_spectrum_into(buf: &[Complex<f64>], out: &mut [f64]) 
   }
 }
 
-/// AVX2+FMA `mel_filterbank_dot`. Currently forwards to scalar (Task SIMD-3).
+/// AVX2+FMA `mel_filterbank_dot`. Computes `Σ weights[i] * power[i]` using
+/// two independent `__m256d` accumulators (8 elements per iteration) and
+/// `_mm256_fmadd_pd` for fused multiply-add. The two-accumulator pattern
+/// keeps the FMA pipeline busy by giving each lane two independent
+/// dependency chains.
+///
+/// # Numerical contract
+///
+/// Output is **not** bit-identical to [`scalar::mel_filterbank_dot`]:
+///
+/// 1. The two parallel accumulators reassociate the summation tree —
+///    pairs of products are summed separately before being combined,
+///    rather than the strictly left-fold of the scalar reference.
+///    Different operand orders → different f64 results, typically off
+///    by ~1 ULP per element.
+/// 2. `_mm256_fmadd_pd` performs `acc + w*p` with **single rounding**,
+///    whereas the scalar's `acc += w * p` rounds twice. FMA generally
+///    tightens accuracy.
+///
+/// Both effects are bounded well below the equivalence-test budget of
+/// `1e-10 * scale` and far below the integration golden mel tolerance of
+/// `1e-4`. The crate-level "byte-identical" claim in [`super`] applies
+/// to [`power_spectrum_into`] only; this kernel deliberately accepts ULP
+/// drift to win the FMA + ILP throughput.
 ///
 /// # Safety
 ///
@@ -88,7 +110,56 @@ pub(crate) unsafe fn power_spectrum_into(buf: &[Complex<f64>], out: &mut [f64]) 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
 pub(crate) unsafe fn mel_filterbank_dot(weights: &[f64], power: &[f64]) -> f64 {
-  scalar::mel_filterbank_dot(weights, power)
+  debug_assert_eq!(weights.len(), power.len());
+  let n = weights.len();
+
+  let mut acc0 = _mm256_setzero_pd();
+  let mut acc1 = _mm256_setzero_pd();
+
+  let w_ptr = weights.as_ptr();
+  let p_ptr = power.as_ptr();
+
+  // Process 8 elements per iteration (two 4-lane f64 vectors).
+  let n_chunks = n / 8;
+  for i in 0..n_chunks {
+    // SAFETY: `i < n_chunks = n / 8` ⇒ `i*8 + 7 < n`, so two
+    // `_mm256_loadu_pd` reads of 4 f64 each (8 f64 total) sit fully
+    // inside the slice. Unaligned loads tolerate the slice's f64
+    // (8-byte) alignment.
+    let w0 = unsafe { _mm256_loadu_pd(w_ptr.add(i * 8)) };
+    let w1 = unsafe { _mm256_loadu_pd(w_ptr.add(i * 8 + 4)) };
+    let p0 = unsafe { _mm256_loadu_pd(p_ptr.add(i * 8)) };
+    let p1 = unsafe { _mm256_loadu_pd(p_ptr.add(i * 8 + 4)) };
+    // Fused multiply-add: `acc + w*p` with a single round. Differs
+    // from scalar's two-round `acc += w * p` — see the numerical
+    // contract above.
+    acc0 = _mm256_fmadd_pd(w0, p0, acc0);
+    acc1 = _mm256_fmadd_pd(w1, p1, acc1);
+  }
+
+  // Reduce the two 4-lane accumulators to a scalar.
+  // 1) Combine accumulators lane-wise: [a, b, c, d].
+  let acc = _mm256_add_pd(acc0, acc1);
+  // 2) Split into 128-bit halves: lo = [a, b], hi = [c, d].
+  //    `_mm256_castpd256_pd128` is a no-op cast; `_mm256_extractf128_pd`
+  //    lifts the upper 128 bits down.
+  let lo = _mm256_castpd256_pd128(acc);
+  let hi = _mm256_extractf128_pd::<1>(acc);
+  // 3) Pairwise add: [a+c, b+d].
+  let sum2 = _mm_add_pd(lo, hi);
+  // 4) Horizontal sum of the remaining 2 lanes:
+  //    `_mm_unpackhi_pd(sum2, sum2)` = [b+d, b+d]; adding low lane to
+  //    `sum2[0]` yields `(a+c) + (b+d)` in lane 0.
+  let result = _mm_add_sd(sum2, _mm_unpackhi_pd(sum2, sum2));
+  let mut total = _mm_cvtsd_f64(result);
+
+  // Tail: 0..7 leftover elements. Falls through the scalar formula.
+  let tail_start = n_chunks * 8;
+  for i in tail_start..n {
+    total += weights[i] * power[i];
+  }
+
+  total
 }
 
 /// AVX2+FMA `first_non_finite`. Currently forwards to scalar (Task SIMD-4).

@@ -7,9 +7,8 @@
 //! from the aarch64 target's default feature set. Same `#[target_feature]`
 //! placement and `#[inline]` policy as `colconv::row::arch::neon`.
 //!
-//! `mel_filterbank_dot` and `first_non_finite` remain placeholder
-//! forwarders to [`super::scalar`] until Tasks SIMD-3 / SIMD-4 fill in
-//! their intrinsics.
+//! `first_non_finite` remains a placeholder forwarder to
+//! [`super::scalar`] until Task SIMD-4 fills in its intrinsics.
 
 use core::arch::aarch64::*;
 use rustfft::num_complex::Complex;
@@ -80,7 +79,32 @@ pub(crate) unsafe fn power_spectrum_into(buf: &[Complex<f64>], out: &mut [f64]) 
   }
 }
 
-/// NEON `mel_filterbank_dot`. Currently forwards to scalar (Task SIMD-3).
+/// NEON `mel_filterbank_dot`. Computes `Σ weights[i] * power[i]` using two
+/// independent `float64x2_t` accumulators (4 elements per iteration) and
+/// `vfmaq_f64` for fused multiply-add. The two-accumulator pattern lets the
+/// CPU dispatch dependent FMAs in parallel — each fmadd has ~3-cycle
+/// latency on Apple Silicon, so a single accumulator would stall on its
+/// own dependency chain; two accumulators keep the FMA pipeline full
+/// (one issue per cycle).
+///
+/// # Numerical contract
+///
+/// Output is **not** bit-identical to [`scalar::mel_filterbank_dot`]:
+///
+/// 1. The two parallel accumulators reassociate the summation tree —
+///    pairs of products are summed separately before being combined,
+///    rather than the strictly left-fold `((0 + a₀b₀) + a₁b₁) + …` of
+///    the scalar reference. Different operand orders → different f64
+///    results, typically off by ~1 ULP per element.
+/// 2. `vfmaq_f64` performs `acc + w*p` with **single rounding**, whereas
+///    the scalar's `acc += w * p` rounds twice (once after the multiply,
+///    once after the add). FMA generally tightens accuracy.
+///
+/// Both effects are bounded well below the equivalence-test budget of
+/// `1e-10 * scale` and far below the integration golden mel tolerance of
+/// `1e-4`. The crate-level "byte-identical" claim in [`super`] applies
+/// to [`power_spectrum_into`] only; this kernel deliberately accepts ULP
+/// drift to win the FMA + ILP throughput.
 ///
 /// # Safety
 ///
@@ -88,7 +112,49 @@ pub(crate) unsafe fn power_spectrum_into(buf: &[Complex<f64>], out: &mut [f64]) 
 #[inline]
 #[target_feature(enable = "neon")]
 pub(crate) unsafe fn mel_filterbank_dot(weights: &[f64], power: &[f64]) -> f64 {
-  scalar::mel_filterbank_dot(weights, power)
+  debug_assert_eq!(weights.len(), power.len());
+  let n = weights.len();
+
+  // Two independent accumulators allow the CPU to issue dependent FMAs
+  // in parallel: each `vfmaq_f64` has ~3-cycle latency on Apple Silicon
+  // but the FMA pipe accepts one issue per cycle.
+  let mut acc0 = vdupq_n_f64(0.0);
+  let mut acc1 = vdupq_n_f64(0.0);
+
+  let w_ptr = weights.as_ptr();
+  let p_ptr = power.as_ptr();
+
+  // Process 4 elements per iteration (two 2-lane f64 vectors).
+  let n_chunks = n / 4;
+  for i in 0..n_chunks {
+    // SAFETY: `i < n_chunks = n / 4` ⇒ `i*4 + 3 < n`, so two
+    // `vld1q_f64` loads of 2 f64 each (4 f64 total) sit fully inside
+    // the slice. Slices are f64-aligned (8 bytes); NEON loads are
+    // unaligned-tolerant.
+    let w0 = unsafe { vld1q_f64(w_ptr.add(i * 4)) };
+    let w1 = unsafe { vld1q_f64(w_ptr.add(i * 4 + 2)) };
+    let p0 = unsafe { vld1q_f64(p_ptr.add(i * 4)) };
+    let p1 = unsafe { vld1q_f64(p_ptr.add(i * 4 + 2)) };
+    // Fused multiply-add: `acc + w*p` with a single round. Differs
+    // from scalar's two-round `acc += w * p` — see the numerical
+    // contract above.
+    acc0 = vfmaq_f64(acc0, w0, p0);
+    acc1 = vfmaq_f64(acc1, w1, p1);
+  }
+
+  // Reduce the two 2-lane accumulators to a scalar. `vaddvq_f64` is
+  // ARMv8's single-instruction horizontal sum (lane 0 + lane 1).
+  let acc = vaddq_f64(acc0, acc1);
+  let mut total = vaddvq_f64(acc);
+
+  // Tail: 0..3 leftover elements. Falls through the scalar formula so
+  // it stays in the same FMA-vs-mul-add round structure as the body.
+  let tail_start = n_chunks * 4;
+  for i in tail_start..n {
+    total += weights[i] * power[i];
+  }
+
+  total
 }
 
 /// NEON `first_non_finite`. Currently forwards to scalar (Task SIMD-4).

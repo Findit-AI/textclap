@@ -14,8 +14,14 @@
 //! requires every intrinsic call inside a backend kernel to sit in an
 //! explicit `unsafe { ... }` block with its own `// SAFETY:` justification.
 //!
-//! Output guarantees: every backend is byte-identical to [`scalar`].
-//! Equivalence tests in Tasks SIMD-2/3/4 enforce that contract.
+//! Output guarantees: [`power_spectrum_into`] is byte-identical to
+//! [`scalar`] across all backends. [`mel_filterbank_dot`] is the
+//! exception — its NEON / AVX2 backends use FMA + 2x ILP, so they
+//! reassociate the summation tree and round once instead of twice.
+//! Drift is bounded at `1e-10 * scale` (loose; see backend doc
+//! comments) — far below the integration golden mel tolerance of
+//! `1e-4`. Equivalence tests in Tasks SIMD-2/3/4 enforce these
+//! contracts.
 //!
 //! Dispatcher `cfg_select!` requires Rust 1.95+ (stable, in the core
 //! prelude — no import needed). The crate's MSRV matches.
@@ -168,6 +174,19 @@ mod tests {
       .collect()
   }
 
+  /// f64 variant of [`make_input`] — same LCG, one sample per step,
+  /// values in `[-1, 1]`. Used by the `mel_filterbank_dot` equivalence
+  /// tests.
+  fn make_input_f64(n: usize, seed: u64) -> Vec<f64> {
+    let mut s = seed;
+    (0..n)
+      .map(|_| {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((s >> 33) as i32 as f64) / i32::MAX as f64
+      })
+      .collect()
+  }
+
   #[test]
   fn power_spectrum_simd_matches_scalar_513() {
     // Real call site uses N_FFT/2+1 = 513 (odd), so the kernel's tail
@@ -213,5 +232,62 @@ mod tests {
     let mut out = vec![0.0f64; 1];
     power_spectrum_into(&input, &mut out);
     assert_eq!(out, vec![25.0]);
+  }
+
+  #[test]
+  fn mel_filterbank_dot_simd_matches_scalar_513() {
+    // Production call site uses N_FFT/2+1 = 513 (odd), so both the
+    // SIMD body and the scalar tail path run.
+    let weights = make_input_f64(513, 0xABCD1234);
+    let power = make_input_f64(513, 0xFEDC4321);
+    let dispatched = mel_filterbank_dot(&weights, &power);
+    let reference = scalar::mel_filterbank_dot(&weights, &power);
+    // Reassociation + FMA can shift bits; budget is loose vs. golden
+    // tolerance.
+    let diff = (dispatched - reference).abs();
+    let scale = reference.abs().max(1.0);
+    assert!(
+      diff <= 1e-10 * scale,
+      "drift exceeds 1e-10 * scale: simd={dispatched} scalar={reference} diff={diff}"
+    );
+  }
+
+  #[test]
+  fn mel_filterbank_dot_simd_matches_scalar_short() {
+    // Production sparse rows can have very few nonzero entries with
+    // leading/trailing zeros. Make sure the tail path works for tiny
+    // inputs (especially n < 4 / n < 8 where the SIMD body never runs).
+    for n in [0, 1, 3, 7, 8, 15, 16, 31, 32] {
+      let weights = make_input_f64(n, 0x1111 + n as u64);
+      let power = make_input_f64(n, 0x2222 + n as u64);
+      let dispatched = mel_filterbank_dot(&weights, &power);
+      let reference = scalar::mel_filterbank_dot(&weights, &power);
+      let diff = (dispatched - reference).abs();
+      let scale = reference.abs().max(1.0);
+      assert!(
+        diff <= 1e-10 * scale,
+        "n={n}: simd={dispatched} scalar={reference}"
+      );
+    }
+  }
+
+  #[test]
+  fn mel_filterbank_dot_zero_weights_zero_result() {
+    // Zero weights (e.g. mel filterbank rows past the last passband)
+    // must produce exactly 0.0, not just near-zero.
+    let weights = vec![0.0f64; 513];
+    let power: Vec<f64> = (0..513).map(|i| i as f64).collect();
+    assert_eq!(mel_filterbank_dot(&weights, &power), 0.0);
+  }
+
+  #[test]
+  fn mel_filterbank_dot_unit_weights_sums_power() {
+    // Unit weights → result equals Σ power. 1+2+…+8 == 36. Validates
+    // the reduction tree end-to-end on a small input where the SIMD
+    // body runs exactly once (n=8).
+    let weights = vec![1.0f64; 8];
+    let power = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let result = mel_filterbank_dot(&weights, &power);
+    assert!((result - 36.0).abs() < 1e-12, "got {result}");
   }
 }
