@@ -61,8 +61,7 @@ fn force_batch_longest_padding(tokenizer: &mut Tokenizer, pad_id: i64) {
   }));
 }
 
-/// Reject `Padding::Fixed` for `from_ort_session` callers. See spec §7.4. Used by Task 24.
-#[allow(dead_code)] // Used by Task 24 from_ort_session.
+/// Reject `Padding::Fixed` for `from_ort_session` callers. See spec §7.4.
 fn reject_fixed_padding(tokenizer: &Tokenizer) -> Result<()> {
   if let Some(p) = tokenizer.get_padding()
     && matches!(p.strategy, PaddingStrategy::Fixed(_))
@@ -125,13 +124,17 @@ impl TextEncoder {
     Self::from_pieces(session, tokenizer, pad_id)
   }
 
-  /// Wrap a pre-built ORT session and tokenizer. See spec §7.4. Implemented in Task 24.
+  /// Wrap a pre-built ORT session and tokenizer. The tokenizer's padding configuration is
+  /// preserved (`BatchLongest`/`Longest`/none); `Padding::Fixed` is rejected to prevent silent
+  /// max_length truncation. See spec §7.4.
   pub fn from_ort_session(
-    _session: Session,
-    _tokenizer: Tokenizer,
+    session: Session,
+    tokenizer: Tokenizer,
     _opts: Options,
   ) -> Result<Self> {
-    unimplemented!("TextEncoder::from_ort_session — implemented in Task 24")
+    reject_fixed_padding(&tokenizer)?;
+    let pad_id = resolve_pad_id(&tokenizer)?;
+    Self::from_pieces(session, tokenizer, pad_id)
   }
 
   fn from_pieces(session: Session, tokenizer: Tokenizer, pad_id: i64) -> Result<Self> {
@@ -211,13 +214,66 @@ impl TextEncoder {
     }
   }
 
-  /// Embed a batch of text queries.
-  pub fn embed_batch(&mut self, _texts: &[&str]) -> Result<Vec<Embedding>> {
-    unimplemented!("TextEncoder::embed_batch — implemented in Task 24")
+  /// Embed a batch of text queries. Padding is `BatchLongest` (forced at construction).
+  /// See spec §7.4 / §9.2.
+  pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Embedding>> {
+    if texts.is_empty() {
+      return Ok(Vec::new());
+    }
+    for (i, t) in texts.iter().enumerate() {
+      if t.is_empty() {
+        return Err(Error::EmptyInput {
+          batch_index: Some(i),
+        });
+      }
+    }
+
+    // BatchLongest padding installed at construction makes all encoded rows the same length.
+    let encodings = self
+      .tokenizer
+      .encode_batch(texts.to_vec(), true)
+      .map_err(Error::Tokenize)?;
+
+    let n = encodings.len();
+    let t_max = encodings[0].get_ids().len();
+    debug_assert!(encodings.iter().all(|e| e.get_ids().len() == t_max));
+
+    self.ids_scratch.clear();
+    self.ids_scratch.reserve(n * t_max);
+    for enc in &encodings {
+      for &id in enc.get_ids() {
+        self.ids_scratch.push(id as i64);
+      }
+    }
+
+    let ids_view = TensorRef::from_array_view(([n, t_max], self.ids_scratch.as_slice()))?;
+
+    let outputs = self.session.run(ort::inputs![
+      TEXT_INPUT_IDS_NAME => ids_view,
+    ])?;
+    let (shape, data) = outputs[TEXT_OUTPUT_NAME].try_extract_tensor::<f32>()?;
+    validate_shape(
+      "text_output",
+      shape.as_ref(),
+      &[n as i64, EMBEDDING_DIM as i64],
+    )?;
+
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+      let mut row = [0.0f32; EMBEDDING_DIM];
+      row.copy_from_slice(&data[i * EMBEDDING_DIM..(i + 1) * EMBEDDING_DIM]);
+      out.push(Self::finalize_embedding(row)?);
+    }
+    Ok(out)
   }
 
-  /// Run a dummy forward to amortize ORT operator specialization.
+  /// Run a dummy forward to amortize ORT operator specialization. See spec §11.4.
   pub fn warmup(&mut self) -> Result<()> {
-    unimplemented!("TextEncoder::warmup — implemented in Task 24")
+    // 9 repetitions of "the quick brown fox jumps over the lazy dog " (trailing space).
+    // Backfilled from tests/fixtures/golden_params.json (warmup_text_repetitions = 9,
+    // warmup_text_token_count = 84). See spec §3.4 / §11.4.
+    const WARMUP_TEXT: &str = "the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog ";
+    let _ = self.embed(WARMUP_TEXT)?;
+    Ok(())
   }
 }
