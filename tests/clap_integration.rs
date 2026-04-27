@@ -206,7 +206,11 @@ fn embed_batch_matches_per_label_embed() {
       "batch[{i}] != per-label embed for {label:?}",
       label = labels[i]
     );
-    assert!(b.is_close_cosine(p, 5e-8), "batch[{i}] cosine drift for {:?}", labels[i]);
+    assert!(
+      b.is_close_cosine(p, 5e-8),
+      "batch[{i}] cosine drift for {:?}",
+      labels[i]
+    );
   }
 }
 
