@@ -6,7 +6,7 @@ on:
     paths-ignore:
       - 'README'
       - 'COPYRIGHT'
-      - 'LICENSE'
+      - 'LICENSE-*'
       - '**.md'
       - '**.txt'
   pull_request:
@@ -14,7 +14,7 @@ on:
     paths-ignore:
       - 'README'
       - 'COPYRIGHT'
-      - 'LICENSE'
+      - 'LICENSE-*'
       - '**.md'
       - '**.txt'
   schedule:
