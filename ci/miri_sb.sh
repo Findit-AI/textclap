@@ -23,7 +23,10 @@ cargo miri setup
 
 export MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-symbolic-alignment-check"
 
-# Library tests only — textclap's integration tests require ORT FFI which
-# Miri cannot simulate. The lib tests are pure compute and exercise the
-# unsafe SIMD paths (pointer arithmetic, target_feature dispatch).
-cargo miri test --lib --target "$TARGET"
+# Scope to the simd module only. Miri cannot simulate the FFI / native-lib
+# dependencies pulled in by mel.rs (rustfft), text.rs (tokenizers /
+# onig_sys), or audio.rs (ort / ONNX Runtime). The simd module is the one
+# place in the crate that contains hand-written `unsafe` blocks worth
+# verifying for UB (pointer arithmetic, target_feature dispatch, aliasing
+# in the per-backend kernels), and its tests are pure compute.
+cargo miri test --lib --target "$TARGET" simd::
