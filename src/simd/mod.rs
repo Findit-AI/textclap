@@ -50,10 +50,13 @@
 //!
 //! ## AVX-512 (x86_64, runtime-detected)
 //!
-//! Selected when `is_x86_feature_detected!("avx512f")` returns true.
-//! AVX-512F implies AVX2 + FMA on every shipped x86_64 CPU (Intel
-//! Skylake-X+, AMD Zen 4+), so a single AVX-512F runtime check is
-//! sufficient. 8-lane f64 / 16-lane f32 — twice the AVX2 lane count.
+//! Selected when avx512f, avx2, and fma are all detected at runtime —
+//! the kernels carry `#[target_feature(enable = "avx512f,avx2,fma")]`,
+//! and the gate explicitly verifies each. Every shipping x86_64 CPU
+//! with AVX-512F also exposes AVX2 + FMA (Intel Skylake-X+ in 2017,
+//! AMD Zen 4+ in 2022), but the safety boundary must verify the
+//! actual feature bits rather than rely on that implication.
+//! 8-lane f64 / 16-lane f32 — twice the AVX2 lane count.
 //! Uses `_mm512_fmadd_pd` for `mel_filterbank_dot`, `_mm512_reduce_add_pd`
 //! for the horizontal sum, and 16-bit mask registers for the
 //! `first_non_finite` existence test. Falls through to AVX2 on CPUs
@@ -130,9 +133,9 @@ pub(crate) fn power_spectrum_into(buf: &[Complex<f64>], out: &mut [f64]) {
     },
     target_arch = "x86_64" => {
       if avx512_available() {
-        // SAFETY: `avx512_available()` verified AVX-512F is present on this CPU.
-        // AVX-512F implies AVX2 + FMA on every shipped x86_64 CPU, satisfying
-        // the kernel's `target_feature(enable = "avx512f,avx2,fma")` contract.
+        // SAFETY: `avx512_available()` verified avx512f + avx2 + fma are present
+        // on this CPU, satisfying the kernel's
+        // `target_feature(enable = "avx512f,avx2,fma")` contract.
         unsafe { x86_avx512::power_spectrum_into(buf, out); }
         return;
       }
@@ -174,8 +177,9 @@ pub(crate) fn mel_filterbank_dot(weights: &[f64], power: &[f64]) -> f64 {
     },
     target_arch = "x86_64" => {
       if avx512_available() {
-        // SAFETY: `avx512_available()` verified AVX-512F is present on this CPU.
-        // AVX-512F implies AVX2 + FMA on every shipped x86_64 CPU.
+        // SAFETY: `avx512_available()` verified avx512f + avx2 + fma are present
+        // on this CPU, satisfying the kernel's
+        // `target_feature(enable = "avx512f,avx2,fma")` contract.
         return unsafe { x86_avx512::mel_filterbank_dot(weights, power) };
       }
       if avx2_fma_available() {
@@ -211,8 +215,9 @@ pub(crate) fn first_non_finite(samples: &[f32]) -> Option<usize> {
     },
     target_arch = "x86_64" => {
       if avx512_available() {
-        // SAFETY: `avx512_available()` verified AVX-512F is present on this CPU.
-        // AVX-512F implies AVX2 + FMA on every shipped x86_64 CPU.
+        // SAFETY: `avx512_available()` verified avx512f + avx2 + fma are present
+        // on this CPU, satisfying the kernel's
+        // `target_feature(enable = "avx512f,avx2,fma")` contract.
         return unsafe { x86_avx512::first_non_finite(samples) };
       }
       if avx2_fma_available() {
@@ -256,17 +261,28 @@ fn avx2_fma_available() -> bool {
   std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
 }
 
-/// AVX-512F availability on x86_64. AVX-512F implies AVX2 + FMA on every
-/// shipped CPU (Intel Skylake-X+, AMD Zen 4+), so a single AVX-512F check
-/// is sufficient — the AVX-512 kernels' `#[target_feature(enable =
-/// "avx512f,avx2,fma")]` contract is satisfied transitively.
+/// AVX-512 backend availability on x86_64. The AVX-512 kernels carry
+/// `#[target_feature(enable = "avx512f,avx2,fma")]`, so the safety contract
+/// for calling the unsafe kernels is "the CPU supports avx512f AND avx2 AND
+/// fma". Every shipping x86_64 CPU with AVX-512F also has AVX2 + FMA (Intel
+/// Skylake-X+ in 2017, AMD Zen 4+ in 2022) — but the safety boundary must
+/// verify the actual feature bits rather than rely on that historical
+/// implication. A hypervisor exposing AVX-512F while masking FMA is
+/// pathological but theoretically possible, and future ISA divergence
+/// could invalidate the assumption. So the gate explicitly checks all three.
 #[cfg(target_arch = "x86_64")]
 #[cfg_attr(not(tarpaulin), inline(always))]
 fn avx512_available() -> bool {
   if cfg!(textclap_force_scalar) {
     return false;
   }
+  // The AVX-512 backend kernels carry #[target_feature(enable = "avx512f,avx2,fma")].
+  // Verify every feature the unsafe contract requires; relying on the historical
+  // implication (every CPU with AVX-512F has AVX2 + FMA) is not enough — the safety
+  // boundary must check the actual feature bits.
   std::arch::is_x86_feature_detected!("avx512f")
+    && std::arch::is_x86_feature_detected!("avx2")
+    && std::arch::is_x86_feature_detected!("fma")
 }
 
 /// simd128 availability on wasm32. WASM has **no runtime CPU detection**
