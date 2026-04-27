@@ -235,7 +235,7 @@ impl AudioEncoder {
         .map(|&o| &samples[o..(o + window).min(samples.len())])
         .collect();
       self.embed_projections_batched(&chunks, &mut tmp_proj)?;
-      accumulator.extend(tmp_proj.drain(..));
+      accumulator.append(&mut tmp_proj);
     }
 
     // Single-chunk case skips aggregation regardless of branch.
