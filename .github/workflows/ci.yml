@@ -74,13 +74,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/textclap-models
-          key: textclap-models-${{ hashFiles('tests/fixtures/MODELS.md') }}
+          key: textclap-models-${{ hashFiles('models/MODELS.md') }}
       - name: Download models
         if: steps.cache-models.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/textclap-models
           # HF revision pin: parsed from the `Revision: <sha>` line in MODELS.md.
-          REV=$(awk '/^Revision:/ {print $2; exit}' tests/fixtures/MODELS.md)
+          REV=$(awk '/^Revision:/ {print $2; exit}' models/MODELS.md)
           if [ -z "$REV" ]; then echo "Could not parse Revision: from MODELS.md" >&2; exit 1; fi
           curl -L -o ~/textclap-models/audio_model_quantized.onnx \
             "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/${REV}/onnx/audio_model_quantized.onnx"
@@ -90,7 +90,7 @@ jobs:
             "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/${REV}/tokenizer.json"
           # Verify SHA256s using the native sha256sum sidecar.
           cd ~/textclap-models
-          sha256sum -c "$GITHUB_WORKSPACE/tests/fixtures/MODELS.sha256"
+          sha256sum -c "$GITHUB_WORKSPACE/models/MODELS.sha256"
       - name: Run integration tests
         run: |
           export TEXTCLAP_MODELS_DIR="$HOME/textclap-models"

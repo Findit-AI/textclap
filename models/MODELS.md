@@ -1,6 +1,8 @@
 # textclap model artifacts
 
-textclap loads three files at runtime; this document pins the verified versions.
+textclap pins three model artifacts; this document records the verified versions. The two ONNX
+files are loaded at runtime from caller-supplied paths; `tokenizer.json` is **bundled with the
+crate** under `models/tokenizer.json` and exposed as `textclap::BUNDLED_TOKENIZER`.
 
 **Source:** [Xenova/clap-htsat-unfused](https://huggingface.co/Xenova/clap-htsat-unfused)
 
@@ -12,7 +14,7 @@ Revision: c28f2883575e590e04d3146ff0713c2448d691ba
 | `text_model_quantized.onnx`   | 121 MB | (see MODELS.sha256)            |
 | `tokenizer.json`              | 2.0 MB | (see MODELS.sha256)            |
 
-The native `sha256sum -c` format lives in the sidecar `tests/fixtures/MODELS.sha256` so CI can verify
+The native `sha256sum -c` format lives in the sidecar `models/MODELS.sha256` so CI can verify
 without parsing markdown:
 
 ```text
@@ -32,12 +34,12 @@ Mismatched SHA256s produce undefined results — typically `Error::SessionSchema
 ```bash
 mkdir -p ~/textclap-models
 cd ~/textclap-models
-REV=$(awk '/^Revision:/ {print $2; exit}' /path/to/textclap/tests/fixtures/MODELS.md)
+REV=$(awk '/^Revision:/ {print $2; exit}' /path/to/textclap/models/MODELS.md)
 curl -L -o audio_model_quantized.onnx \
   "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/${REV}/onnx/audio_model_quantized.onnx"
 curl -L -o text_model_quantized.onnx \
   "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/${REV}/onnx/text_model_quantized.onnx"
 curl -L -o tokenizer.json \
   "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/${REV}/tokenizer.json"
-sha256sum -c /path/to/textclap/tests/fixtures/MODELS.sha256
+sha256sum -c /path/to/textclap/models/MODELS.sha256
 ```

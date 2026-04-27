@@ -16,6 +16,8 @@ include = [
     "CHANGELOG.md",
     "LICENSE-*",
     "COPYRIGHT",
+    "models/tokenizer.json",
+    "models/MODELS.md",
 ]
 
 [dependencies]
