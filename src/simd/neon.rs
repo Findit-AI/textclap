@@ -6,14 +6,9 @@
 //! in an explicitly NEON-enabled context rather than one merely inherited
 //! from the aarch64 target's default feature set. Same `#[target_feature]`
 //! placement and `#[inline]` policy as `colconv::row::arch::neon`.
-//!
-//! `first_non_finite` remains a placeholder forwarder to
-//! [`super::scalar`] until Task SIMD-4 fills in its intrinsics.
 
 use core::arch::aarch64::*;
 use rustfft::num_complex::Complex;
-
-use super::scalar;
 
 /// NEON `power_spectrum_into`. Computes `out[i] = buf[i].re² + buf[i].im²`
 /// using `vld2q_f64` to deinterleave 2 `Complex<f64>` per iteration into
@@ -157,7 +152,29 @@ pub(crate) unsafe fn mel_filterbank_dot(weights: &[f64], power: &[f64]) -> f64 {
   total
 }
 
-/// NEON `first_non_finite`. Currently forwards to scalar (Task SIMD-4).
+/// NEON `first_non_finite`. Linear scan for the first NaN or ±∞ sample
+/// using a per-chunk bit-mask test of the IEEE 754 exponent field.
+///
+/// # IEEE 754 bit-mask trick
+///
+/// An f32 is non-finite (NaN or ±∞) iff its biased 8-bit exponent is
+/// `0xFF`. In the 32-bit pattern `s eeeeeeee mmmmmmmmmmmmmmmmmmmmmmm`,
+/// the exponent occupies bits 23..30 — exactly the mask `0x7F800000`.
+/// So `(bits & 0x7F800000) == 0x7F800000` ⇔ value is non-finite. This
+/// classifies `±0`, subnormals, and every normal number as **finite**
+/// (their exponent is not all-ones), matching `f32::is_finite`.
+///
+/// # Strategy
+///
+/// Two-phase. Body processes 8 elements per iteration (two
+/// `float32x4_t`) for instruction-level parallelism: load both halves,
+/// AND with the exponent mask, compare-equal to the mask, OR the two
+/// 4-lane masks, then `vmaxvq_u32` reduces to a single u32. Any non-zero
+/// result means at least one of the 8 lanes is non-finite — fall back
+/// to scalar within the chunk to find the exact first index. The
+/// common (all-finite) path is branch-free per chunk. The trailing
+/// 0..7 elements (`n` not divisible by 8) are handled by the scalar
+/// tail.
 ///
 /// # Safety
 ///
@@ -165,5 +182,57 @@ pub(crate) unsafe fn mel_filterbank_dot(weights: &[f64], power: &[f64]) -> f64 {
 #[inline]
 #[target_feature(enable = "neon")]
 pub(crate) unsafe fn first_non_finite(samples: &[f32]) -> Option<usize> {
-  scalar::first_non_finite(samples)
+  let n = samples.len();
+  let ptr = samples.as_ptr();
+
+  // Exponent-bits mask: an f32's biased exponent occupies bits 23..30,
+  // so masking with `0x7F800000` isolates them. A non-finite value
+  // (NaN or ±∞) has every exponent bit set.
+  const EXP_MASK: u32 = 0x7F800000;
+  let exp_mask = vdupq_n_u32(EXP_MASK);
+
+  // Process 8 elements per iteration (two float32x4_t).
+  let n_chunks = n / 8;
+  for chunk in 0..n_chunks {
+    let base = chunk * 8;
+    // SAFETY: `chunk < n_chunks = n / 8` ⇒ `base + 7 < n`, so two
+    // `vld1q_f32` reads of 4 f32 each (8 f32 total) sit fully inside
+    // the slice. Slices are f32-aligned (4 bytes); NEON loads are
+    // unaligned-tolerant.
+    let v0 = unsafe { vld1q_f32(ptr.add(base)) };
+    let v1 = unsafe { vld1q_f32(ptr.add(base + 4)) };
+    // Reinterpret the f32 lanes as u32 to manipulate the bit pattern.
+    let b0 = vreinterpretq_u32_f32(v0);
+    let b1 = vreinterpretq_u32_f32(v1);
+    // Isolate the exponent field of each lane.
+    let e0 = vandq_u32(b0, exp_mask);
+    let e1 = vandq_u32(b1, exp_mask);
+    // Per-lane mask: `0xFFFFFFFF` if the exponent is all-ones (i.e.
+    // the lane is non-finite), `0` otherwise.
+    let m0 = vceqq_u32(e0, exp_mask);
+    let m1 = vceqq_u32(e1, exp_mask);
+    // OR the two 4-lane masks, then reduce across lanes with the
+    // standard "max-of-mask" idiom: any non-zero lane → max non-zero.
+    let combined = vorrq_u32(m0, m1);
+    if vmaxvq_u32(combined) != 0 {
+      // Hit somewhere in this 8-element chunk. Fall back to scalar
+      // to find the exact first index. The compiler can't see that
+      // at least one of the 8 must be non-finite, so this loop
+      // always finds a hit in practice but is defensively complete.
+      for i in base..base + 8 {
+        if !samples[i].is_finite() {
+          return Some(i);
+        }
+      }
+    }
+  }
+
+  // Tail: 0..7 leftover elements that didn't fit a full 8-lane chunk.
+  let tail_start = n_chunks * 8;
+  for i in tail_start..n {
+    if !samples[i].is_finite() {
+      return Some(i);
+    }
+  }
+  None
 }

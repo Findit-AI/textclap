@@ -7,14 +7,9 @@
 //! rather than one merely inherited from the x86_64 target's default
 //! feature set. Same `#[target_feature]` placement and `#[inline]`
 //! policy as `colconv::row::arch::x86_avx2`.
-//!
-//! `first_non_finite` remains a placeholder forwarder to
-//! [`super::scalar`] until Task SIMD-4 fills in its intrinsics.
 
 use core::arch::x86_64::*;
 use rustfft::num_complex::Complex;
-
-use super::scalar;
 
 /// AVX2+FMA `power_spectrum_into`. Computes `out[i] = buf[i].re² + buf[i].im²`
 /// using a 256-bit unaligned load of 2 `Complex<f64>` (= 4 f64
@@ -162,7 +157,32 @@ pub(crate) unsafe fn mel_filterbank_dot(weights: &[f64], power: &[f64]) -> f64 {
   total
 }
 
-/// AVX2+FMA `first_non_finite`. Currently forwards to scalar (Task SIMD-4).
+/// AVX2+FMA `first_non_finite`. Linear scan for the first NaN or ±∞
+/// sample using a per-chunk bit-mask test of the IEEE 754 exponent
+/// field.
+///
+/// # IEEE 754 bit-mask trick
+///
+/// An f32 is non-finite (NaN or ±∞) iff its biased 8-bit exponent is
+/// `0xFF`. In the 32-bit pattern `s eeeeeeee mmmmmmmmmmmmmmmmmmmmmmm`,
+/// the exponent occupies bits 23..30 — exactly the mask `0x7F800000`.
+/// So `(bits & 0x7F800000) == 0x7F800000` ⇔ value is non-finite. This
+/// classifies `±0`, subnormals, and every normal number as **finite**
+/// (their exponent is not all-ones), matching `f32::is_finite`.
+///
+/// # Strategy
+///
+/// Two-phase. Body processes 16 elements per iteration (two `__m256`
+/// vectors of 8 f32 each) for instruction-level parallelism: load
+/// both halves, AND with the exponent mask, compare-equal to the mask,
+/// OR the two 8-lane masks, then `_mm256_testz_si256` reduces to a
+/// single bit (zero/non-zero). `testz(c, c) == 0` ⇔ at least one bit
+/// of `c` is set ⇔ at least one lane is non-finite — fall back to
+/// scalar within the chunk to find the exact first index. `testz` is a
+/// single instruction and cheaper than `_mm256_movemask_epi8` + an
+/// integer compare. The common (all-finite) path is branch-free per
+/// chunk. The trailing 0..15 elements (`n` not divisible by 16) are
+/// handled by the scalar tail.
 ///
 /// # Safety
 ///
@@ -170,5 +190,57 @@ pub(crate) unsafe fn mel_filterbank_dot(weights: &[f64], power: &[f64]) -> f64 {
 #[inline]
 #[target_feature(enable = "avx2,fma")]
 pub(crate) unsafe fn first_non_finite(samples: &[f32]) -> Option<usize> {
-  scalar::first_non_finite(samples)
+  let n = samples.len();
+  let ptr = samples.as_ptr();
+
+  // Exponent-bits mask: an f32's biased exponent occupies bits 23..30,
+  // so masking with `0x7F800000` isolates them. A non-finite value
+  // (NaN or ±∞) has every exponent bit set.
+  let exp_mask_i = _mm256_set1_epi32(0x7F800000_u32 as i32);
+
+  // Process 16 elements per iteration (two __m256 of 8 f32 each).
+  let n_chunks = n / 16;
+  for chunk in 0..n_chunks {
+    let base = chunk * 16;
+    // SAFETY: `chunk < n_chunks = n / 16` ⇒ `base + 15 < n`, so two
+    // `_mm256_loadu_ps` reads of 8 f32 each (16 f32 total) sit fully
+    // inside the slice. Unaligned loads tolerate the slice's f32
+    // (4-byte) alignment.
+    let v0 = unsafe { _mm256_loadu_ps(ptr.add(base)) };
+    let v1 = unsafe { _mm256_loadu_ps(ptr.add(base + 8)) };
+    // Reinterpret the f32 lanes as i32 to manipulate the bit pattern.
+    let b0 = _mm256_castps_si256(v0);
+    let b1 = _mm256_castps_si256(v1);
+    // Isolate the exponent field of each lane.
+    let e0 = _mm256_and_si256(b0, exp_mask_i);
+    let e1 = _mm256_and_si256(b1, exp_mask_i);
+    // Per-lane mask: `0xFFFFFFFF` if the exponent is all-ones (i.e.
+    // the lane is non-finite), `0` otherwise.
+    let c0 = _mm256_cmpeq_epi32(e0, exp_mask_i);
+    let c1 = _mm256_cmpeq_epi32(e1, exp_mask_i);
+    // OR the two 8-lane masks; any set bit anywhere in `combined`
+    // means at least one of the 16 lanes was non-finite.
+    let combined = _mm256_or_si256(c0, c1);
+    // `_mm256_testz_si256(a, b)` returns 1 iff `a & b == 0`. Feeding
+    // `combined` as both operands makes this an "all-zero?" test:
+    // result `0` ⇒ some bit is set ⇒ fall back to scalar.
+    if _mm256_testz_si256(combined, combined) == 0 {
+      // Hit somewhere in this 16-element chunk. Fall back to scalar
+      // to find the exact first index.
+      for i in base..base + 16 {
+        if !samples[i].is_finite() {
+          return Some(i);
+        }
+      }
+    }
+  }
+
+  // Tail: 0..15 leftover elements that didn't fit a full 16-lane chunk.
+  let tail_start = n_chunks * 16;
+  for i in tail_start..n {
+    if !samples[i].is_finite() {
+      return Some(i);
+    }
+  }
+  None
 }

@@ -290,4 +290,69 @@ mod tests {
     let result = mel_filterbank_dot(&weights, &power);
     assert!((result - 36.0).abs() < 1e-12, "got {result}");
   }
+
+  #[test]
+  fn first_non_finite_simd_finds_nan_at_zero() {
+    let mut s = vec![0.0f32; 100];
+    s[0] = f32::NAN;
+    assert_eq!(first_non_finite(&s), Some(0));
+  }
+
+  #[test]
+  fn first_non_finite_simd_finds_inf_in_middle() {
+    let mut s = vec![0.0f32; 1000];
+    s[472] = f32::INFINITY;
+    assert_eq!(first_non_finite(&s), Some(472));
+  }
+
+  #[test]
+  fn first_non_finite_simd_finds_neg_inf_at_end() {
+    // Element near end, in the scalar-tail region for chunk_size=16.
+    let mut s = vec![0.0f32; 1023];
+    s[1022] = f32::NEG_INFINITY;
+    assert_eq!(first_non_finite(&s), Some(1022));
+  }
+
+  #[test]
+  fn first_non_finite_simd_clean_input_returns_none() {
+    let s: Vec<f32> = (0..480_000).map(|i| (i as f32) * 1e-3).collect();
+    assert_eq!(first_non_finite(&s), None);
+  }
+
+  #[test]
+  fn first_non_finite_simd_subnormal_is_finite() {
+    // Subnormals (exponent = 0) are finite. Must NOT trigger.
+    let s = vec![f32::MIN_POSITIVE / 2.0; 64];
+    assert_eq!(first_non_finite(&s), None);
+  }
+
+  #[test]
+  fn first_non_finite_simd_zero_and_negzero_are_finite() {
+    let s = vec![0.0f32, -0.0f32, 0.0, -0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    assert_eq!(first_non_finite(&s), None);
+  }
+
+  #[test]
+  fn first_non_finite_simd_short_inputs() {
+    // Scalar-only path (n < chunk size).
+    for n in 0..16 {
+      let mut s = vec![1.0f32; n];
+      if n > 0 {
+        s[n - 1] = f32::NAN;
+        assert_eq!(first_non_finite(&s), Some(n - 1), "n={n}");
+      } else {
+        assert_eq!(first_non_finite(&s), None, "n=0");
+      }
+    }
+  }
+
+  #[test]
+  fn first_non_finite_simd_at_chunk_boundary() {
+    // Verify the boundary case where the non-finite is exactly at chunk_size on AVX2 (16) or NEON (8).
+    for hit in [7usize, 8, 15, 16, 23, 24] {
+      let mut s = vec![1.0f32; 100];
+      s[hit] = f32::NAN;
+      assert_eq!(first_non_finite(&s), Some(hit), "hit={hit}");
+    }
+  }
 }
