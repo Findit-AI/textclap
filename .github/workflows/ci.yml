@@ -92,6 +92,6 @@ jobs:
           cd ~/textclap-models
           sha256sum -c "$GITHUB_WORKSPACE/tests/fixtures/MODELS.sha256"
       - name: Run integration tests
-        env:
-          TEXTCLAP_MODELS_DIR: ~/textclap-models
-        run: cargo test --test clap_integration
+        run: |
+          export TEXTCLAP_MODELS_DIR="$HOME/textclap-models"
+          cargo test --test clap_integration
