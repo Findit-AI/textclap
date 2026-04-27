@@ -215,6 +215,7 @@ pub(crate) unsafe fn first_non_finite(samples: &[f32]) -> Option<usize> {
     if (m0 | m1) != 0 {
       // Hit somewhere in this 32-element chunk; fall back to scalar
       // to find the exact first index.
+      #[allow(clippy::needless_range_loop)]
       for i in base..base + 32 {
         if !samples[i].is_finite() {
           return Some(i);
@@ -225,10 +226,5 @@ pub(crate) unsafe fn first_non_finite(samples: &[f32]) -> Option<usize> {
 
   // Tail: 0..31 leftover elements that didn't fit a full 32-lane chunk.
   let tail_start = n_chunks * 32;
-  for i in tail_start..n {
-    if !samples[i].is_finite() {
-      return Some(i);
-    }
-  }
-  None
+  (tail_start..n).find(|&i| !samples[i].is_finite())
 }

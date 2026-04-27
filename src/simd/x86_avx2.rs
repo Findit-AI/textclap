@@ -227,6 +227,7 @@ pub(crate) unsafe fn first_non_finite(samples: &[f32]) -> Option<usize> {
     if _mm256_testz_si256(combined, combined) == 0 {
       // Hit somewhere in this 16-element chunk. Fall back to scalar
       // to find the exact first index.
+      #[allow(clippy::needless_range_loop)]
       for i in base..base + 16 {
         if !samples[i].is_finite() {
           return Some(i);
@@ -237,10 +238,5 @@ pub(crate) unsafe fn first_non_finite(samples: &[f32]) -> Option<usize> {
 
   // Tail: 0..15 leftover elements that didn't fit a full 16-lane chunk.
   let tail_start = n_chunks * 16;
-  for i in tail_start..n {
-    if !samples[i].is_finite() {
-      return Some(i);
-    }
-  }
-  None
+  (tail_start..n).find(|&i| !samples[i].is_finite())
 }
