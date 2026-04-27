@@ -270,22 +270,26 @@ pub struct Clap {
 impl Clap {
   /// Load from three file paths.
   pub fn from_files<P: AsRef<Path>>(
-    _audio_onnx: P,
-    _text_onnx: P,
-    _tokenizer_json: P,
-    _opts: Options,
+    audio_onnx: P,
+    text_onnx: P,
+    tokenizer_json: P,
+    opts: Options,
   ) -> Result<Self> {
-    unimplemented!("Clap::from_files — implemented in Task 25/26")
+    let audio = AudioEncoder::from_file(audio_onnx, opts)?;
+    let text = TextEncoder::from_files(text_onnx, tokenizer_json, opts)?;
+    Ok(Self { audio, text })
   }
 
   /// Load from caller-supplied bytes.
   pub fn from_memory(
-    _audio_bytes: &[u8],
-    _text_bytes: &[u8],
-    _tokenizer_bytes: &[u8],
-    _opts: Options,
+    audio_bytes: &[u8],
+    text_bytes: &[u8],
+    tokenizer_bytes: &[u8],
+    opts: Options,
   ) -> Result<Self> {
-    unimplemented!("Clap::from_memory — implemented in Task 26")
+    let audio = AudioEncoder::from_memory(audio_bytes, opts)?;
+    let text = TextEncoder::from_memory(text_bytes, tokenizer_bytes, opts)?;
+    Ok(Self { audio, text })
   }
 
   /// Mutable access to the audio encoder.
@@ -300,7 +304,9 @@ impl Clap {
 
   /// Warm up both encoders.
   pub fn warmup(&mut self) -> Result<()> {
-    unimplemented!("Clap::warmup — implemented in Task 26")
+    self.audio.warmup()?;
+    self.text.warmup()?;
+    Ok(())
   }
 
   /// Top-k zero-shot classification.
