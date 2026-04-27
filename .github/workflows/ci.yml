@@ -3,19 +3,32 @@ name: CI
 on:
   push:
     branches: [main, "0.*"]
+    paths-ignore:
+      - 'README'
+      - 'COPYRIGHT'
+      - 'LICENSE'
+      - '**.md'
+      - '**.txt'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'README'
+      - 'COPYRIGHT'
+      - 'LICENSE'
+      - '**.md'
+      - '**.txt'
   schedule:
     - cron: "0 4 1 * *" # monthly
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
 
 jobs:
   rustfmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -28,11 +41,21 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         features: ["", "--all-features"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: textclap-${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            textclap-${{ runner.os }}-clippy-
+      - run: cargo clippy --all-targets ${{ matrix.features }}
 
   build-test:
     runs-on: ${{ matrix.os }}
@@ -40,22 +63,175 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: textclap-${{ runner.os }}-build-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            textclap-${{ runner.os }}-build-test-
       - run: cargo build --verbose
       - run: cargo test --lib --verbose
 
   doctest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: textclap-${{ runner.os }}-doctest-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            textclap-${{ runner.os }}-doctest-
       - run: cargo test --doc --all-features
+
+  # Build-only verification across selected non-host architectures. Confirms
+  # the per-arch cfg gates on src/simd/x86_avx512.rs, x86_avx2.rs, and
+  # neon.rs compile cleanly under each target_arch. Targets are limited to
+  # those textclap can plausibly link given its `ort` (ONNX Runtime FFI) +
+  # `tokenizers` (with `onig_sys` C build via cc-rs) dependencies; broader
+  # cross targets that are exercised in colconv's reference CI (Android,
+  # musl, powerpc64, riscv64, all wasm32-*) are skipped here because the
+  # ORT/tokenizers C deps don't compile for them.
+  cross:
+    name: cross-${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - x86_64-pc-windows-gnu
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: textclap-${{ runner.os }}-cross-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            textclap-${{ runner.os }}-cross-${{ matrix.target }}-
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo build --target ${{ matrix.target }}
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo build --lib --target ${{ matrix.target }}
+
+  # Run the x86_64 lib test suite under Intel SDE with Ice Lake (`-icx`)
+  # emulation. The standard ubuntu-latest runner is AMD Milan (no native
+  # AVX-512), so without SDE the AVX-512 kernel's
+  # `is_x86_feature_detected!("avx512f")` gate returns false and the
+  # AVX-512 dispatch path is dead code at runtime. With SDE, `-icx`
+  # reports AVX-512F via its CPUID intercept, so the new kernels in
+  # src/simd/x86_avx512.rs actually execute and compare against the
+  # scalar reference in `simd::tests::*`.
+  #
+  # SDE slowdown is ~5-10×; lib tests are pure compute so they run in
+  # well under a minute even under emulation.
+  test-sde-avx512:
+    name: test-sde-avx512
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: textclap-${{ runner.os }}-test-sde-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            textclap-${{ runner.os }}-test-sde-
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Intel SDE
+        uses: petarpetrovt/setup-sde@v3.0
+        with:
+          sdeVersion: 9.33.0
+          environmentVariableName: SDE_PATH
+      - name: Run lib tests under SDE (-icx, Ice Lake AVX-512)
+        # The `petarpetrovt/setup-sde` action exports `SDE_PATH` but does
+        # not add the extracted directory to `PATH`, so `sde64` isn't on
+        # PATH directly. Resolve the full path via shell expansion before
+        # handing it to cargo as the runner.
+        #
+        # `cargo test --lib` (NOT --all-features). The optional `serde`
+        # feature doesn't change SIMD behavior; lib tests cover
+        # `simd::tests::*` which is what the AVX-512 emulation gates.
+        shell: bash
+        run: |
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$SDE_PATH/sde64 -icx --"
+          cargo test --lib
+
+  miri-tb:
+    name: miri-tb-${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: textclap-${{ runner.os }}-miri-tb-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            textclap-${{ runner.os }}-miri-tb-${{ matrix.target }}-
+      - name: Miri (tree-borrows)
+        run: bash ci/miri_tb.sh "${{ matrix.target }}"
+
+  miri-sb:
+    name: miri-sb-${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: textclap-${{ runner.os }}-miri-sb-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            textclap-${{ runner.os }}-miri-sb-${{ matrix.target }}-
+      - name: Miri (stacked-borrows)
+        run: bash ci/miri_sb.sh "${{ matrix.target }}"
 
   coverage:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-tarpaulin
       - run: cargo tarpaulin --out Xml --workspace --all-features
@@ -67,11 +243,11 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache models
         id: cache-models
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/textclap-models
           key: textclap-models-${{ hashFiles('models/MODELS.md') }}
@@ -95,3 +271,34 @@ jobs:
         run: |
           export TEXTCLAP_MODELS_DIR="$HOME/textclap-models"
           cargo test --test clap_integration
+
+# NOT INCLUDED: test-wasm-simd128 (analogous to colconv's job).
+# textclap depends on `ort` (ONNX Runtime FFI) and `tokenizers` (with
+# `onig_sys` C build via cc-rs, plus `esaxx-rs` C++ tokenizer), none of
+# which compile to wasm32-wasip1 or wasm32-unknown-unknown. Local probe:
+#
+#   $ cargo build --lib --target wasm32-wasip1
+#   error: ort-sys does not provide prebuilt binaries for wasm32-wasip1
+#   error: esaxx-rs failed: 'cstdint' not found (no libc++ sysroot)
+#
+#   $ cargo check --target wasm32-unknown-unknown -p textclap --no-default-features
+#   error: onig_sys failed: 'stdlib.h' not found
+#   error: getrandom requires the `wasm_js` configuration flag
+#
+# The wasm32 simd128 backend at src/simd/wasm_simd128.rs is therefore
+# compile-only verified (via `cargo check` on isolated mini-crates during
+# local development); runtime behavior on simd128 hardware is exercised
+# only when downstream callers carve out a wasm-targeting shape.
+#
+# Jobs intentionally NOT included from colconv's reference CI:
+#
+# - sanitizer (ASan/LSan/MSan/TSan): textclap's lib tests don't exercise
+#   the SIMD `unsafe` paths in isolation — the `simd::tests::*` block
+#   does, but those are pure compute. ASan would mostly check the
+#   integration tests, which require ORT FFI and add complexity that
+#   exceeds the value-vs-cost tradeoff for v0.1.0. Miri-tb / miri-sb
+#   cover the SIMD pointer arithmetic adequately.
+#
+# - benchmark (Criterion regression tracking): the `benches/` already
+#   exist; running them in CI is heavy and noisy without baseline
+#   storage. Add later if performance regressions become a concern.
