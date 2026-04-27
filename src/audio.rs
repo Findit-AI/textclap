@@ -2,13 +2,14 @@
 
 use std::path::Path;
 
-use ort::session::Session;
-use ort::value::TensorRef;
+use ort::{session::Session, value::TensorRef};
 
-use crate::clap_model::{Embedding, NORM_BUDGET};
-use crate::error::{Error, Result};
-use crate::mel::{MelExtractor, T_FRAMES};
-use crate::options::{ChunkingOptions, Options};
+use crate::{
+  clap::{Embedding, NORM_BUDGET},
+  error::{Error, Result},
+  mel::{MelExtractor, T_FRAMES},
+  options::{ChunkingOptions, Options},
+};
 
 // Backfilled from golden_onnx_io.json per §3.4. Module-private.
 const AUDIO_INPUT_NAME: &str = "input_features";
@@ -24,11 +25,7 @@ const EMBEDDING_DIM: usize = 512;
 
 /// Validate an ORT output shape against the expected one. Sibling-convention parameter order:
 /// (actual, expected) — matches silero `session.rs`.
-pub(crate) fn validate_shape(
-  tensor: &'static str,
-  actual: &[i64],
-  expected: &[i64],
-) -> Result<()> {
+pub(crate) fn validate_shape(tensor: &'static str, actual: &[i64], expected: &[i64]) -> Result<()> {
   if actual != expected {
     return Err(Error::UnexpectedTensorShape {
       tensor,
@@ -97,7 +94,7 @@ impl AudioEncoder {
   fn from_loaded_session(session: Session) -> Result<Self> {
     // Schema check — ensures the wrapped session matches the contract recorded by §3.2.
     let inputs: Vec<&str> = session.inputs().iter().map(|i| i.name()).collect();
-    if !inputs.iter().any(|n| *n == AUDIO_INPUT_NAME) {
+    if !inputs.contains(&AUDIO_INPUT_NAME) {
       return Err(Error::SessionSchema {
         detail: format!(
           "audio session missing expected input {:?}; got inputs {:?}",
@@ -106,7 +103,7 @@ impl AudioEncoder {
       });
     }
     let outputs: Vec<&str> = session.outputs().iter().map(|o| o.name()).collect();
-    if !outputs.iter().any(|n| *n == AUDIO_OUTPUT_NAME) {
+    if !outputs.contains(&AUDIO_OUTPUT_NAME) {
       return Err(Error::SessionSchema {
         detail: format!(
           "audio session missing expected output {:?}; got outputs {:?}",
@@ -158,7 +155,9 @@ impl AudioEncoder {
     // Per-clip validation.
     for (i, clip) in clips.iter().enumerate() {
       if clip.is_empty() {
-        return Err(Error::EmptyAudio { clip_index: Some(i) });
+        return Err(Error::EmptyAudio {
+          clip_index: Some(i),
+        });
       }
       if clip.len() > TARGET_SAMPLES {
         return Err(Error::AudioTooLong {
@@ -185,11 +184,7 @@ impl AudioEncoder {
 
   /// Arbitrary-length input via textclap's chunking convention. NOT LAION-reference compatible.
   /// See spec §7.3 / §8.2.
-  pub fn embed_chunked(
-    &mut self,
-    samples: &[f32],
-    opts: &ChunkingOptions,
-  ) -> Result<Embedding> {
+  pub fn embed_chunked(&mut self, samples: &[f32], opts: &ChunkingOptions) -> Result<Embedding> {
     if samples.is_empty() {
       return Err(Error::EmptyAudio { clip_index: None });
     }

@@ -2,7 +2,7 @@
 
 use std::{fmt, path::Path};
 
-use derive_more::{AsRef, Deref, Display};
+use derive_more::{AsRef, Deref};
 use smol_str::{SmolStr, ToSmolStr};
 
 use crate::{

@@ -7,8 +7,7 @@
 
 use std::sync::Arc;
 
-use rustfft::num_complex::Complex;
-use rustfft::{Fft, FftPlanner};
+use rustfft::{Fft, FftPlanner, num_complex::Complex};
 
 use crate::error::Result;
 
@@ -263,7 +262,7 @@ mod tests {
 
     // Range invariant: 0 ≤ win[k] ≤ 1 for all k.
     for &v in &win {
-      assert!(v >= 0.0 && v <= 1.0 + 1e-7);
+      assert!((0.0..=1.0 + 1e-7).contains(&v));
     }
 
     // Peak invariant: for periodic Hann with denom=N, the unique peak (1.0) sits at index N/2.
@@ -352,11 +351,12 @@ mod tests {
       hound::SampleFormat::Int => {
         let bits = reader.spec().bits_per_sample;
         let scale = 1.0 / (1_i64 << (bits - 1)) as f32;
-        reader.samples::<i32>().map(|s| s.unwrap() as f32 * scale).collect()
+        reader
+          .samples::<i32>()
+          .map(|s| s.unwrap() as f32 * scale)
+          .collect()
       }
-      hound::SampleFormat::Float => {
-        reader.samples::<f32>().map(|s| s.unwrap()).collect()
-      }
+      hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
     };
 
     let mut mel = MelExtractor::new();
@@ -387,6 +387,7 @@ mod tests {
     let mut mel = MelExtractor::new();
     let sr = 48_000_f32;
     let mut samples = vec![0.0f32; TARGET_SAMPLES];
+    #[allow(clippy::needless_range_loop)]
     for k in 0..TARGET_SAMPLES {
       samples[k] = (2.0 * std::f32::consts::PI * 1000.0 * (k as f32) / sr).sin();
     }
@@ -400,7 +401,7 @@ mod tests {
       "single-application 10·log10 of unit-sine mel should peak near 29.3 dB; got max = {max}",
     );
     assert!(
-      min >= -100.0 - 1e-3 && min < -50.0,
+      (-100.0 - 1e-3..-50.0).contains(&min),
       "amin floor should clip silent bins to -100 dB; got min = {min}",
     );
   }

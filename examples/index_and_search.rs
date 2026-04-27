@@ -4,8 +4,7 @@
 //! cannot naturally show both as live, so this example is explicitly sequential.
 //! See spec §1.1 / §13.
 
-use std::env;
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 use textclap::{Clap, Options};
 
@@ -35,7 +34,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   // -- Query side: encode a search text and compute cosine similarity --
   let query = clap.text_mut().embed("dog barking near a door")?;
   let similarity = audio_emb.cosine(&query);
-  println!("cosine similarity to 'dog barking near a door': {:.4}", similarity);
+  println!(
+    "cosine similarity to 'dog barking near a door': {:.4}",
+    similarity
+  );
 
   // -- Read-back demo: stored vectors round-trip through try_from_unit_slice --
   let stored_bytes = audio_emb.to_vec();

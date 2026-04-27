@@ -1,5 +1,4 @@
-use std::env;
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
@@ -20,15 +19,38 @@ fn bench_text_encode(c: &mut Criterion) {
 
   let mut group = c.benchmark_group("text_encode");
   let queries = [
-    "a dog barking", "rain on a metal roof", "applause in a stadium",
-    "engine starting", "music with drums", "speech with crowd",
-    "door creaking", "alarm sound", "water running", "wind through trees",
-    "footsteps on gravel", "phone ringing", "glass breaking", "coffee shop ambience",
-    "thunderstorm", "bird chirping", "traffic noise", "cat meowing",
-    "typing on a keyboard", "fire crackling", "ocean waves", "helicopter overhead",
-    "construction noise", "violin solo", "drum kit", "electronic beep",
-    "child laughing", "lecture hall", "guitar strumming", "vacuum cleaner",
-    "clock ticking", "wind chimes",
+    "a dog barking",
+    "rain on a metal roof",
+    "applause in a stadium",
+    "engine starting",
+    "music with drums",
+    "speech with crowd",
+    "door creaking",
+    "alarm sound",
+    "water running",
+    "wind through trees",
+    "footsteps on gravel",
+    "phone ringing",
+    "glass breaking",
+    "coffee shop ambience",
+    "thunderstorm",
+    "bird chirping",
+    "traffic noise",
+    "cat meowing",
+    "typing on a keyboard",
+    "fire crackling",
+    "ocean waves",
+    "helicopter overhead",
+    "construction noise",
+    "violin solo",
+    "drum kit",
+    "electronic beep",
+    "child laughing",
+    "lecture hall",
+    "guitar strumming",
+    "vacuum cleaner",
+    "clock ticking",
+    "wind chimes",
   ];
 
   for &n in &[1usize, 8, 32] {

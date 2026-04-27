@@ -1,5 +1,4 @@
-use std::env;
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
@@ -10,11 +9,8 @@ fn bench_audio_encode(c: &mut Criterion) {
     eprintln!("skipping bench_audio_encode: TEXTCLAP_MODELS_DIR not set");
     return;
   };
-  let mut audio = AudioEncoder::from_file(
-    dir.join("audio_model_quantized.onnx"),
-    Options::new(),
-  )
-  .expect("AudioEncoder::from_file");
+  let mut audio = AudioEncoder::from_file(dir.join("audio_model_quantized.onnx"), Options::new())
+    .expect("AudioEncoder::from_file");
   audio.warmup().expect("warmup");
 
   let mut group = c.benchmark_group("audio_encode");

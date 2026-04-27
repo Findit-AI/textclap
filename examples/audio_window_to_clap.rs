@@ -4,13 +4,12 @@
 //! Run with TEXTCLAP_MODELS_DIR set to a directory containing audio_model_quantized.onnx.
 //! See spec §1.1.
 
-use std::env;
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 use rubato::{
   Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+  audioadapter_buffers::direct::SequentialSliceOfVecs,
 };
-use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use textclap::{AudioEncoder, Options};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -56,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   for i in 0..frames_per_chunk {
     // Synthesize a 1 kHz sine for demonstration; real pipeline reads from the decoder.
     let mut frame = vec![0.0f32; chunk_size];
+    #[allow(clippy::needless_range_loop)]
     for k in 0..chunk_size {
       let t = (i * chunk_size + k) as f32 / source_rate as f32;
       frame[k] = (2.0 * std::f32::consts::PI * 1000.0 * t).sin();

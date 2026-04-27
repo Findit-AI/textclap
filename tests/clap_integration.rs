@@ -3,8 +3,7 @@
 //! When unset, all tests print a skip message and pass (so `cargo test` doesn't fail in
 //! environments without the model files). When set, runs the §12.2 assertion battery.
 
-use std::env;
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 use textclap::{Clap, Embedding, Options};
 

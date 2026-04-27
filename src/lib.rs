@@ -7,8 +7,7 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 mod audio;
-mod clap_model; // not `mod clap` to avoid shadowing the `clap` CLI crate if a future
-// dev-dep pulls it in
+mod clap;
 mod error;
 mod mel;
 mod options;
@@ -16,7 +15,7 @@ mod text;
 
 pub use crate::{
   audio::AudioEncoder,
-  clap_model::{Clap, Embedding, LabeledScore, LabeledScoreOwned},
+  clap::{Clap, Embedding, LabeledScore, LabeledScoreOwned},
   error::{Error, Result},
   options::{ChunkingOptions, GraphOptimizationLevel, Options},
   text::TextEncoder,

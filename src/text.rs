@@ -2,14 +2,15 @@
 
 use std::path::Path;
 
-use ort::session::Session;
-use ort::value::TensorRef;
+use ort::{session::Session, value::TensorRef};
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
 
-use crate::audio::validate_shape;
-use crate::clap_model::{Embedding, NORM_BUDGET};
-use crate::error::{Error, Result};
-use crate::options::Options;
+use crate::{
+  audio::validate_shape,
+  clap::{Embedding, NORM_BUDGET},
+  error::{Error, Result},
+  options::Options,
+};
 
 // Backfilled from golden_onnx_io.json per §3.4. Module-private.
 // The Xenova clap-htsat-unfused export inlines attention_mask and position_ids derivation
@@ -27,7 +28,8 @@ pub struct TextEncoder {
   tokenizer: Tokenizer,
   /// Cached at construction. Reserved for future exports that externalize position_ids
   /// (the Xenova export inlines it; pad_id is the diagnostic source of truth here).
-  #[allow(dead_code)] // Used if §3.2 externalizes position_ids; preserved for diagnostic/reflection.
+  #[allow(dead_code)]
+  // Used if §3.2 externalizes position_ids; preserved for diagnostic/reflection.
   pad_id: i64,
   /// Reused scratch for input_ids tensor binding.
   ids_scratch: Vec<i64>,
@@ -127,11 +129,7 @@ impl TextEncoder {
   /// Wrap a pre-built ORT session and tokenizer. The tokenizer's padding configuration is
   /// preserved (`BatchLongest`/`Longest`/none); `Padding::Fixed` is rejected to prevent silent
   /// max_length truncation. See spec §7.4.
-  pub fn from_ort_session(
-    session: Session,
-    tokenizer: Tokenizer,
-    _opts: Options,
-  ) -> Result<Self> {
+  pub fn from_ort_session(session: Session, tokenizer: Tokenizer, _opts: Options) -> Result<Self> {
     reject_fixed_padding(&tokenizer)?;
     let pad_id = resolve_pad_id(&tokenizer)?;
     Self::from_pieces(session, tokenizer, pad_id)
@@ -139,7 +137,7 @@ impl TextEncoder {
 
   fn from_pieces(session: Session, tokenizer: Tokenizer, pad_id: i64) -> Result<Self> {
     let inputs: Vec<&str> = session.inputs().iter().map(|i| i.name()).collect();
-    if !inputs.iter().any(|n| *n == TEXT_INPUT_IDS_NAME) {
+    if !inputs.contains(&TEXT_INPUT_IDS_NAME) {
       return Err(Error::SessionSchema {
         detail: format!(
           "text session missing expected input {:?}; got inputs {:?}",
@@ -148,7 +146,7 @@ impl TextEncoder {
       });
     }
     let outputs: Vec<&str> = session.outputs().iter().map(|o| o.name()).collect();
-    if !outputs.iter().any(|n| *n == TEXT_OUTPUT_NAME) {
+    if !outputs.contains(&TEXT_OUTPUT_NAME) {
       return Err(Error::SessionSchema {
         detail: format!(
           "text session missing expected output {:?}; got outputs {:?}",
@@ -169,10 +167,7 @@ impl TextEncoder {
     if text.is_empty() {
       return Err(Error::EmptyInput { batch_index: None });
     }
-    let encoding = self
-      .tokenizer
-      .encode(text, true)
-      .map_err(Error::Tokenize)?;
+    let encoding = self.tokenizer.encode(text, true).map_err(Error::Tokenize)?;
     let t = encoding.get_ids().len();
 
     // Resize scratch + cast u32 → i64.
