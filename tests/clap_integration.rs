@@ -328,3 +328,44 @@ fn classify_discrimination_check() {
     dog - music,
   );
 }
+
+/// Regression for the Codex round-5 finding: embed_chunked must produce a single chunk
+/// (and therefore a bit-identical result to embed) when samples.len() <= window_samples,
+/// regardless of the caller's hop choice. Previously the offset loop ran unconditionally
+/// and overlapping hops on a short clip produced multiple chunks whose centroid drifted
+/// from embed()'s output.
+#[test]
+fn embed_chunked_short_input_matches_embed() {
+  let Some(dir) = models_dir() else {
+    eprintln!("skipping: TEXTCLAP_MODELS_DIR not set");
+    return;
+  };
+  let mut clap = Clap::from_files(
+    dir.join("audio_model_quantized.onnx"),
+    dir.join("text_model_quantized.onnx"),
+    dir.join("tokenizer.json"),
+    Options::new(),
+  )
+  .expect("Clap::from_files");
+
+  let samples = read_wav_48k_mono("tests/fixtures/sample.wav");
+  // sample.wav is 5 s @ 48 kHz = 240_000 samples, well under the 480_000 window.
+  assert!(samples.len() <= 480_000);
+
+  // Hop intentionally smaller than samples.len() so the old buggy loop would have
+  // generated a second offset at `hop` and aggregated two embeddings.
+  let opts = textclap::ChunkingOptions::new()
+    .with_window_samples(480_000)
+    .with_hop_samples(120_000)
+    .with_batch_size(1);
+
+  let chunked = clap.audio_mut().embed_chunked(&samples, &opts).expect("embed_chunked");
+  let plain = clap.audio_mut().embed(&samples).expect("embed");
+
+  // Single-chunk path goes straight through finalize_embedding with no aggregation,
+  // so the result is bit-identical to embed().
+  assert!(
+    chunked.is_close(&plain, 1e-7),
+    "embed_chunked drift vs embed exceeds 1e-7 for samples.len() <= window with hop < samples.len()"
+  );
+}

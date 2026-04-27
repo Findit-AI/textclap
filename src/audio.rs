@@ -207,19 +207,28 @@ impl AudioEncoder {
       });
     }
 
-    // Chunk offsets: 0, hop, 2·hop, …; skip trailing < window/4 unless the input itself is shorter.
+    // Chunk offsets. Inputs at or below the window produce exactly one chunk so the
+    // result is bit-identical to `embed(samples)` regardless of the caller's hop —
+    // overlapping hops on a short clip would otherwise re-embed the same content and
+    // bias the centroid toward whichever windowed slice the chosen hop happened to
+    // select. For longer inputs, generate offsets at 0, hop, 2·hop, …, dropping
+    // trailing chunks shorter than window/4.
     let window = opts.window_samples();
     let hop = opts.hop_samples();
-    let min_keep = window / 4;
     let mut offsets: Vec<usize> = Vec::new();
-    let mut off = 0;
-    while off < samples.len() {
-      let remain = samples.len() - off;
-      let chunk_len = remain.min(window);
-      if chunk_len >= min_keep || offsets.is_empty() {
-        offsets.push(off);
+    if samples.len() <= window {
+      offsets.push(0);
+    } else {
+      let min_keep = window / 4;
+      let mut off = 0;
+      while off < samples.len() {
+        let remain = samples.len() - off;
+        let chunk_len = remain.min(window);
+        if chunk_len >= min_keep || offsets.is_empty() {
+          offsets.push(off);
+        }
+        off += hop;
       }
-      off += hop;
     }
 
     // Process in groups of batch_size; accumulate raw projections.
