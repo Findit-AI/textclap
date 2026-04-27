@@ -15,7 +15,6 @@ include = [
     "README.md",
     "CHANGELOG.md",
     "LICENSE-*",
-    "COPYRIGHT",
     "models/tokenizer.json",
     "models/MODELS.md",
 ]

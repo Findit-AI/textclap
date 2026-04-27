@@ -39,6 +39,13 @@ pub enum Error {
   #[error("failed to load tokenizer from memory: {0}")]
   TokenizerLoadFromMemory(#[source] tokenizers::Error),
 
+  /// Tokenizer configuration (truncation / padding) failed after the tokenizer was
+  /// already loaded. Distinct from `TokenizerLoadFromFile` / `TokenizerLoadFromMemory`
+  /// because the failure happens at config-set time, not at load time, and is reachable
+  /// from all three constructors (`from_files`, `from_memory`, `from_ort_session`).
+  #[error("tokenizer configuration failed: {0}")]
+  TokenizerConfig(#[source] tokenizers::Error),
+
   /// Tokenizer has no padding configuration AND no `<pad>` token.
   #[error(
     "tokenizer has no pad token (configure padding in tokenizer.json or include a <pad> token)"

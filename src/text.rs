@@ -87,7 +87,7 @@ fn force_max_length_truncation(tokenizer: &mut Tokenizer) -> Result<()> {
       stride: 0,
       direction: TruncationDirection::Right,
     }))
-    .map_err(Error::TokenizerLoadFromMemory)?;
+    .map_err(Error::TokenizerConfig)?;
   Ok(())
 }
 
