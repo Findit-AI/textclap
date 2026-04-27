@@ -38,6 +38,10 @@ pub(crate) struct MelExtractor {
   window: Vec<f64>,       // length N_FFT
   filterbank: Vec<f64>,   // length N_MELS × (N_FFT/2 + 1)
   fft: Arc<dyn Fft<f64>>, // FftPlanner output for N_FFT
+  /// In-place FFT input buffer (length `N_FFT`), reused across all frames of a clip.
+  fft_input: Vec<Complex<f64>>,
+  /// FFT scratch buffer (length `fft.get_inplace_scratch_len()`), reused across frames.
+  fft_scratch: Vec<Complex<f64>>,
 }
 
 impl MelExtractor {
@@ -137,28 +141,37 @@ impl MelExtractor {
     let filterbank = Self::build_mel_filterbank(SR, N_FFT, N_MELS, FMIN, FMAX);
     let mut planner = FftPlanner::<f64>::new();
     let fft = planner.plan_fft_forward(N_FFT);
+    let fft_input = vec![Complex::new(0.0_f64, 0.0); N_FFT];
+    let fft_scratch = vec![Complex::new(0.0_f64, 0.0); fft.get_inplace_scratch_len()];
     Self {
       window,
       filterbank,
       fft,
+      fft_input,
+      fft_scratch,
     }
   }
 
   /// Compute |X[k]|² for a single Hann-windowed frame of length N_FFT.
   /// `power` must have length N_FFT/2 + 1 = 513. Computed in f64 to match HF.
-  fn stft_one_frame_power(&self, frame: &[f64], power: &mut [f64]) {
+  fn stft_one_frame_power(&mut self, frame: &[f64], power: &mut [f64]) {
     debug_assert_eq!(frame.len(), N_FFT);
     debug_assert_eq!(power.len(), N_FFT / 2 + 1);
-    // Window the frame, build a Complex<f64> buffer, run a full complex FFT, then take the
-    // first N_FFT/2 + 1 bins (real-FFT identity).
-    let mut buf: Vec<Complex<f64>> = frame
-      .iter()
+    // Window the frame in-place into the reusable FFT input buffer.
+    for ((dst, &s), &w) in self
+      .fft_input
+      .iter_mut()
+      .zip(frame.iter())
       .zip(self.window.iter())
-      .map(|(&s, &w)| Complex::<f64>::new(s * w, 0.0))
-      .collect();
-    self.fft.process(&mut buf);
-    // Use only the first N_FFT/2 + 1 bins (real-FFT identity); discard the conjugate symmetric tail.
-    crate::simd::power_spectrum_into(&buf[..N_FFT / 2 + 1], power);
+    {
+      *dst = Complex::new(s * w, 0.0);
+    }
+    // Run FFT in-place using the reusable scratch buffer.
+    self
+      .fft
+      .process_with_scratch(&mut self.fft_input, &mut self.fft_scratch);
+    // |X[k]|² for the first N_FFT/2 + 1 bins (real-FFT identity).
+    crate::simd::power_spectrum_into(&self.fft_input[..N_FFT / 2 + 1], power);
   }
 
   /// Compute mel features and write into `out`. Caller must size `out` to exactly `T_FRAMES * 64`
@@ -312,7 +325,7 @@ mod tests {
   /// k = 1000 / (48000 / 1024) = 21.33 → bin 21 (or 22).
   #[test]
   fn stft_peaks_at_expected_bin() {
-    let mel = MelExtractor::new();
+    let mut mel = MelExtractor::new();
     let sr = 48000_f64;
     let freq = 1000.0_f64;
     let mut samples = Vec::with_capacity(1024);
