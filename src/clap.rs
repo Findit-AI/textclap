@@ -474,7 +474,12 @@ mod tests {
     s[37] = f32::NAN;
     let err = Embedding::try_from_unit_slice(&s).unwrap_err();
     assert!(
-      matches!(err, Error::NonFiniteEmbedding { component_index: 37 }),
+      matches!(
+        err,
+        Error::NonFiniteEmbedding {
+          component_index: 37
+        }
+      ),
       "got {err:?}"
     );
   }
@@ -487,7 +492,12 @@ mod tests {
     }
     s[100] = f32::INFINITY;
     let err = Embedding::try_from_unit_slice(&s).unwrap_err();
-    assert!(matches!(err, Error::NonFiniteEmbedding { component_index: 100 }));
+    assert!(matches!(
+      err,
+      Error::NonFiniteEmbedding {
+        component_index: 100
+      }
+    ));
   }
 
   #[test]
@@ -498,7 +508,10 @@ mod tests {
     }
     s[0] = f32::NEG_INFINITY;
     let err = Embedding::try_from_unit_slice(&s).unwrap_err();
-    assert!(matches!(err, Error::NonFiniteEmbedding { component_index: 0 }));
+    assert!(matches!(
+      err,
+      Error::NonFiniteEmbedding { component_index: 0 }
+    ));
   }
 
   #[test]

@@ -234,7 +234,11 @@ impl TextEncoder {
       .map_err(Error::Tokenize)?;
 
     let n = encodings.len();
-    let t_max = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+    let t_max = encodings
+      .iter()
+      .map(|e| e.get_ids().len())
+      .max()
+      .unwrap_or(0);
     // Empty-batch was short-circuited above; t_max is at least the longest non-empty encoding.
     debug_assert!(t_max > 0);
 

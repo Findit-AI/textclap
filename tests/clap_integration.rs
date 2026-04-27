@@ -131,7 +131,10 @@ fn embed_chunked_rejects_oversize_window_runtime() {
   let err = clap.audio_mut().embed_chunked(&samples, &opts).unwrap_err();
   // ChunkingConfig variant should fire.
   let msg = format!("{err}");
-  assert!(msg.contains("invalid chunking options"), "unexpected error: {msg}");
+  assert!(
+    msg.contains("invalid chunking options"),
+    "unexpected error: {msg}"
+  );
 }
 
 /// Regression for the Codex finding: `from_ort_session` preserves the caller's padding
@@ -151,17 +154,14 @@ fn from_ort_session_uneven_lengths_no_padding() {
     .commit_from_file(dir.join("text_model_quantized.onnx"))
     .expect("commit_from_file");
 
-  let mut tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
-    .expect("tokenizer load");
+  let mut tokenizer =
+    tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer load");
   // Drop any padding configuration to exercise the embed_batch pad-loop's robustness.
   tokenizer.with_padding(None);
 
-  let mut text = textclap::TextEncoder::from_ort_session(
-    session,
-    tokenizer,
-    textclap::Options::new(),
-  )
-  .expect("from_ort_session");
+  let mut text =
+    textclap::TextEncoder::from_ort_session(session, tokenizer, textclap::Options::new())
+      .expect("from_ort_session");
 
   // Intentionally uneven lengths: 1 word vs 5 words vs 2 words.
   let labels = ["rain", "the quick brown fox jumps", "a dog"];
