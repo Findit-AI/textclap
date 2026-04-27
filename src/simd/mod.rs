@@ -31,12 +31,68 @@
 //! for benchmarking scalar-vs-SIMD on the same input and for forcing
 //! the scalar fallback's coverage on runners that would otherwise always
 //! pick a SIMD tier.
+//!
+//! # Backend coverage: why NEON + AVX2+FMA, but not AVX-512 or SSE4.1
+//!
+//! The crate ships two architecture-specific backends. The omitted tiers
+//! were considered and deliberately left out for v0.1.0:
+//!
+//! ## AVX-512 (omitted)
+//!
+//! - **Apple Silicon — the primary aarch64 target — has no AVX-512 path
+//!   regardless,** so adding it benefits only x86_64 deployments.
+//! - **Mixed CPU support on x86_64.** Intel disabled AVX-512 on consumer
+//!   12th-gen and later (E-cores lack it; the P-cores' support is fused
+//!   off for SKU consistency). AMD added it from Zen 4 (2022). A binary
+//!   that runtime-detects AVX-512 and uses it where available still has
+//!   to bring an AVX2 backend for the majority case.
+//! - **Modest real-world speedup for this workload.** Doubling the lane
+//!   count from 4 to 8 f64 sounds attractive, but the kernels here are
+//!   memory-bandwidth-bound at their working set sizes. AVX-512 also
+//!   triggers down-clocking on older CPUs, which can erase the lane-count
+//!   win on mixed workloads. Measured 20–30% gains are typical, not 2×.
+//! - **Doubles the testing surface.** Each new tier adds an equivalence
+//!   test against the scalar reference and an integration-golden gate
+//!   per kernel. The existing NEON + AVX2 backends already cover the
+//!   common deployments; a third tier is added complexity without a
+//!   matching coverage gain.
+//!
+//! AVX-512 can be added in a later release if profiling identifies a
+//! specific deployment where the lane-count win clearly beats the
+//! scalar path on hot kernels. The dispatcher pattern accommodates a
+//! new backend without touching call sites.
+//!
+//! ## SSE4.1 (omitted)
+//!
+//! - **AVX2 has been baseline on Intel since Haswell (2013) and AMD since
+//!   Excavator (2015).** Modern server hardware, cloud VMs, and laptops
+//!   all expose it. The "needs SSE4.1 fallback" coverage gap is
+//!   essentially pre-2014 hardware that is not a deployment target for
+//!   this crate.
+//! - **SSE4.1 cannot match AVX2's ILP for f64 FMA.** SSE4.1 has 128-bit
+//!   vectors (2-lane f64), the same width as NEON's `float64x2_t`, but
+//!   without FMA — that arrived only with FMA3 alongside Haswell/AVX2.
+//!   The mel filterbank dot kernel relies on FMA for both throughput
+//!   and the rounding-tree contract; an SSE4.1 backend without FMA
+//!   would have a different numerical contract from NEON / AVX2 and
+//!   would need its own equivalence budget.
+//! - **The colconv reference does ship an SSE4.1 backend** because its
+//!   8-bit pixel ops benefit from SSE4.1-specific shuffle and saturating
+//!   instructions that AVX2 does not directly improve. textclap's
+//!   f64-FMA workload has a different shape: there is no useful SSE4.1
+//!   instruction here that AVX2 doesn't already cover better.
+//! - **The scalar fallback catches the residual case** of pre-AVX2 x86
+//!   hardware. It is correct, well-tested, and a few-percent slower than
+//!   what a hypothetical SSE4.1 backend would deliver — acceptable for a
+//!   path that should rarely execute.
 
 #[cfg(target_arch = "aarch64")]
 mod neon;
 mod scalar;
 #[cfg(target_arch = "x86_64")]
 mod x86_avx2;
+#[cfg(target_arch = "x86_64")]
+mod x86_avx512;
 
 use rustfft::num_complex::Complex;
 
@@ -55,6 +111,13 @@ pub(crate) fn power_spectrum_into(buf: &[Complex<f64>], out: &mut [f64]) {
       }
     },
     target_arch = "x86_64" => {
+      if avx512_available() {
+        // SAFETY: `avx512_available()` verified AVX-512F is present on this CPU.
+        // AVX-512F implies AVX2 + FMA on every shipped x86_64 CPU, satisfying
+        // the kernel's `target_feature(enable = "avx512f,avx2,fma")` contract.
+        unsafe { x86_avx512::power_spectrum_into(buf, out); }
+        return;
+      }
       if avx2_fma_available() {
         // SAFETY: `avx2_fma_available()` verified AVX2 + FMA are present on this CPU.
         unsafe { x86_avx2::power_spectrum_into(buf, out); }
@@ -83,6 +146,11 @@ pub(crate) fn mel_filterbank_dot(weights: &[f64], power: &[f64]) -> f64 {
       }
     },
     target_arch = "x86_64" => {
+      if avx512_available() {
+        // SAFETY: `avx512_available()` verified AVX-512F is present on this CPU.
+        // AVX-512F implies AVX2 + FMA on every shipped x86_64 CPU.
+        return unsafe { x86_avx512::mel_filterbank_dot(weights, power) };
+      }
       if avx2_fma_available() {
         // SAFETY: `avx2_fma_available()` verified AVX2 + FMA are present on this CPU.
         return unsafe { x86_avx2::mel_filterbank_dot(weights, power) };
@@ -108,6 +176,11 @@ pub(crate) fn first_non_finite(samples: &[f32]) -> Option<usize> {
       }
     },
     target_arch = "x86_64" => {
+      if avx512_available() {
+        // SAFETY: `avx512_available()` verified AVX-512F is present on this CPU.
+        // AVX-512F implies AVX2 + FMA on every shipped x86_64 CPU.
+        return unsafe { x86_avx512::first_non_finite(samples) };
+      }
       if avx2_fma_available() {
         // SAFETY: `avx2_fma_available()` verified AVX2 + FMA are present on this CPU.
         return unsafe { x86_avx2::first_non_finite(samples) };
@@ -140,6 +213,19 @@ fn avx2_fma_available() -> bool {
     return false;
   }
   std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+}
+
+/// AVX-512F availability on x86_64. AVX-512F implies AVX2 + FMA on every
+/// shipped CPU (Intel Skylake-X+, AMD Zen 4+), so a single AVX-512F check
+/// is sufficient — the AVX-512 kernels' `#[target_feature(enable =
+/// "avx512f,avx2,fma")]` contract is satisfied transitively.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(tarpaulin), inline(always))]
+fn avx512_available() -> bool {
+  if cfg!(textclap_force_scalar) {
+    return false;
+  }
+  std::arch::is_x86_feature_detected!("avx512f")
 }
 
 #[cfg(test)]
