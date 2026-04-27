@@ -359,7 +359,10 @@ fn embed_chunked_short_input_matches_embed() {
     .with_hop_samples(120_000)
     .with_batch_size(1);
 
-  let chunked = clap.audio_mut().embed_chunked(&samples, &opts).expect("embed_chunked");
+  let chunked = clap
+    .audio_mut()
+    .embed_chunked(&samples, &opts)
+    .expect("embed_chunked");
   let plain = clap.audio_mut().embed(&samples).expect("embed");
 
   // Single-chunk path goes straight through finalize_embedding with no aggregation,
