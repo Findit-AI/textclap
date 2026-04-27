@@ -7,9 +7,19 @@
 //!
 //! These implementations are bit-identical to the original inline loops
 //! that lived in `mel.rs` and `audio.rs` before the SIMD scaffold was
-//! introduced. SIMD backends must produce results that are byte-identical
-//! to these references on every input — equivalence tests in later tasks
-//! enforce that contract.
+//! introduced. Output guarantees vary per kernel:
+//!
+//! - [`power_spectrum_into`]: byte-identical to scalar across all
+//!   backends (no FMA, no reassociation in any backend kernel).
+//! - [`mel_filterbank_dot`]: byte-identical on the wasm32 simd128
+//!   backend (no FMA available); the NEON / AVX2 / AVX-512 backends
+//!   use FMA + 2x ILP and reassociate the summation tree, with a
+//!   bounded drift budget of `1e-10 * scale` (well under the
+//!   integration-golden mel tolerance of `1e-4`).
+//! - [`first_non_finite`]: structural equivalence — every backend
+//!   must return the same `Option<usize>` index.
+//!
+//! Equivalence tests in `simd::tests` enforce these contracts.
 
 use rustfft::num_complex::Complex;
 

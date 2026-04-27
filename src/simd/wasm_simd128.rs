@@ -15,10 +15,11 @@
 //!
 //! - [`power_spectrum_into`]: bit-identical to [`super::scalar`] —
 //!   plain mul + add, no FMA (simd128 baseline lacks FMA).
-//! - [`mel_filterbank_dot`]: bit-identical to scalar — uses
-//!   `f64x2_mul` + `f64x2_add` (no FMA), so the rounding tree matches
-//!   the scalar reference exactly. **Different from the NEON / AVX2 /
-//!   AVX-512 backends**, which use FMA and reassociation.
+//! - [`mel_filterbank_dot`]: per-product rounding matches scalar
+//!   (no FMA), but the two-accumulator pattern reassociates the
+//!   summation, so output is drift-bounded at `1e-10 * scale` rather
+//!   than bit-identical. **Differs from NEON / AVX2 / AVX-512** in
+//!   that those backends additionally use FMA; simd128 does not.
 //! - [`first_non_finite`]: structural equivalence with scalar.
 //!
 //! # Pipeline width
@@ -99,12 +100,14 @@ pub(crate) unsafe fn power_spectrum_into(buf: &[Complex<f64>], out: &mut [f64]) 
 ///
 /// # Numerical contract
 ///
-/// Output is bit-identical to [`super::scalar::mel_filterbank_dot`] in
-/// the rounding-tree sense: with no FMA available, the kernel uses the
-/// same `mul` + `add` round structure as the scalar reference. The
-/// two-accumulator pattern still reassociates the summation slightly
-/// (pairs sum independently before being combined), but with no FMA
-/// the per-product rounding matches scalar exactly.
+/// Per-product rounding is identical to [`super::scalar::mel_filterbank_dot`]
+/// — with no FMA available in the simd128 baseline, each `w * p` rounds
+/// once and each accumulator add rounds once, exactly as in the scalar
+/// reference. However, the two-accumulator pattern reassociates the
+/// summation tree (pair-stripe sums combined at the end), which can
+/// flip the last f64 bit relative to the scalar's strict left-to-right
+/// fold. Drift is bounded similarly to the NEON / AVX backends at
+/// `1e-10 * scale`, well below the integration-golden mel tolerance.
 ///
 /// # Safety
 ///
