@@ -30,8 +30,6 @@ from pathlib import Path
 import librosa
 import numpy as np
 import onnxruntime as ort
-import torch
-import torch.nn.functional as F
 from tokenizers import Tokenizer
 from transformers import ClapFeatureExtractor
 

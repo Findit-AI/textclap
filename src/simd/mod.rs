@@ -10,11 +10,14 @@
 //! intrinsics execute in an explicitly feature-enabled context rather
 //! than one merely inherited from the target's default features.
 //!
-//! `unsafe` is confined to the architecture-specific submodules. The
-//! scalar reference plus this dispatcher contain no `unsafe` blocks. The
-//! crate-level lint [`unsafe_op_in_unsafe_fn`](https://doc.rust-lang.org/rustc/lints/listing/deny-by-default.html#unsafe-op-in-unsafe-fn)
-//! requires every intrinsic call inside a backend kernel to sit in an
-//! explicit `unsafe { ... }` block with its own `// SAFETY:` justification.
+//! `unsafe` is confined to the architecture-specific submodules plus this
+//! dispatcher's guarded calls into those backend kernels; the scalar
+//! reference itself contains no `unsafe` blocks. The crate-level lint
+//! [`unsafe_op_in_unsafe_fn`](https://doc.rust-lang.org/rustc/lints/listing/deny-by-default.html#unsafe-op-in-unsafe-fn)
+//! requires every `unsafe fn` invocation (load / store intrinsics plus the
+//! per-arch backend entry points; pure-arithmetic SIMD intrinsics became
+//! safe `fn` under `#[target_feature]` in Rust 1.79+) to sit in an explicit
+//! `unsafe { ... }` block with its own `// SAFETY:` justification.
 //!
 //! Output guarantees: [`power_spectrum_into`] is byte-identical to
 //! [`scalar`] across all backends. [`mel_filterbank_dot`] is the
