@@ -31,6 +31,28 @@ it does not embed Whisper transcripts or any STT output. See the spec at
 
 ## Quick start
 
+The simplest path uses the crate's bundled tokenizer — supply only the two ONNX files:
+
+```rust,no_run
+use textclap::{Clap, Options};
+
+async fn run(user_query: &str, samples: &[f32]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut clap = Clap::from_onnx_files(
+        "audio_model_quantized.onnx",
+        "text_model_quantized.onnx",
+        Options::new(),
+    )?;
+    clap.warmup()?;
+    let labels = ["a dog barking", "rain", "music"];
+    let scores = clap.classify(samples, &labels, 3)?;
+    let _q = clap.text_mut().embed(user_query)?;
+    Ok(())
+}
+```
+
+Indexing-only and query-only workers can skip the unused encoder by going through
+`AudioEncoder::from_file` or `TextEncoder::from_onnx_file` directly:
+
 ```rust,no_run
 use textclap::{AudioEncoder, Options, TextEncoder};
 
@@ -45,10 +67,10 @@ fn run_indexer() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-// Query-only worker:
+// Query-only worker (uses the bundled tokenizer; no separate file needed):
 async fn run_query(user_query: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut text = TextEncoder::from_files(
-        "text_model_quantized.onnx", "tokenizer.json", Options::new(),
+    let mut text = TextEncoder::from_onnx_file(
+        "text_model_quantized.onnx", Options::new(),
     )?;
     text.warmup()?;
     let q = text.embed(user_query)?;
@@ -61,20 +83,43 @@ The `Box<dyn std::error::Error>` wrapper lets `?` mix textclap errors with calle
 lancedb errors without writing `From` impls. In library code, wrap textclap's `Error` in your own
 concrete error type.
 
+### Advanced: bring your own tokenizer
+
+If you need a different tokenizer revision, use the 3-path `Clap::from_files` (or the matching
+`TextEncoder::from_files`) and supply your own `tokenizer.json`:
+
+```rust,no_run
+use textclap::{Clap, Options};
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let _clap = Clap::from_files(
+        "audio_model_quantized.onnx",
+        "text_model_quantized.onnx",
+        "tokenizer.json",
+        Options::new(),
+    )?;
+    Ok(())
+}
+```
+
+The pinned tokenizer bytes shipped with the crate are also exposed as the
+`textclap::BUNDLED_TOKENIZER` `&'static [u8]` constant — useful when constructing via `from_memory`.
+
 ## Model files
 
-textclap loads three files at runtime. They are **not bundled** with the crate. Download from
+textclap loads two ONNX files at runtime; the third file (`tokenizer.json`) is **bundled with the
+crate**. Download the ONNX files from
 [Xenova/clap-htsat-unfused](https://huggingface.co/Xenova/clap-htsat-unfused) and verify SHA256:
 
 | File                         | Size   | SHA256                                              |
 |------------------------------|--------|-----------------------------------------------------|
-| `audio_model_quantized.onnx` | 33 MB  | *(see `tests/fixtures/MODELS.md`)*                  |
-| `text_model_quantized.onnx`  | 121 MB | *(see `tests/fixtures/MODELS.md`)*                  |
-| `tokenizer.json`             | 2.0 MB | *(see `tests/fixtures/MODELS.md`)*                  |
+| `audio_model_quantized.onnx` | 33 MB  | *(see `models/MODELS.md`)*                          |
+| `text_model_quantized.onnx`  | 121 MB | *(see `models/MODELS.md`)*                          |
+| `tokenizer.json`             | 2.0 MB | **bundled with the crate** — no download needed     |
 
-**The `tokenizer.json` must come from the same Xenova export** — *not* from
+**The bundled `tokenizer.json` comes from the Xenova export** — *not* from
 `laion/clap-htsat-unfused` directly. They differ subtly and produce token-id mismatches that pass tests
-on common English but break on edge cases.
+on common English but break on edge cases. If you need to override it, see the advanced section above.
 
 ## Deployment
 
