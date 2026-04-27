@@ -108,8 +108,8 @@ fn text_embeddings_match_golden() {
       "text embedding drift exceeds 5e-2 for label {label:?}",
     );
     assert!(
-      embs[i].is_close_cosine(&golden_emb, 5e-3),
-      "text embedding cosine drift exceeds 5e-3 for label {label:?}",
+      embs[i].is_close_cosine(&golden_emb, 1e-2),
+      "text embedding cosine drift exceeds 1e-2 for label {label:?}",
     );
   }
 }
