@@ -156,8 +156,8 @@ impl TextEncoder {
         path: onnx.to_path_buf(),
         source,
       })?;
-    let mut tokenizer = Tokenizer::from_bytes(crate::BUNDLED_TOKENIZER)
-      .map_err(Error::TokenizerLoadFromMemory)?;
+    let mut tokenizer =
+      Tokenizer::from_bytes(crate::BUNDLED_TOKENIZER).map_err(Error::TokenizerLoadFromMemory)?;
     let pad_id = resolve_pad_id(&tokenizer)?;
     force_batch_longest_padding(&mut tokenizer, pad_id);
     force_max_length_truncation(&mut tokenizer)?;

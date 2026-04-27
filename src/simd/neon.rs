@@ -219,6 +219,7 @@ pub(crate) unsafe fn first_non_finite(samples: &[f32]) -> Option<usize> {
       // to find the exact first index. The compiler can't see that
       // at least one of the 8 must be non-finite, so this loop
       // always finds a hit in practice but is defensively complete.
+      #[allow(clippy::needless_range_loop)]
       for i in base..base + 8 {
         if !samples[i].is_finite() {
           return Some(i);
@@ -229,10 +230,5 @@ pub(crate) unsafe fn first_non_finite(samples: &[f32]) -> Option<usize> {
 
   // Tail: 0..7 leftover elements that didn't fit a full 8-lane chunk.
   let tail_start = n_chunks * 8;
-  for i in tail_start..n {
-    if !samples[i].is_finite() {
-      return Some(i);
-    }
-  }
-  None
+  (tail_start..n).find(|&i| !samples[i].is_finite())
 }
