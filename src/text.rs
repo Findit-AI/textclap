@@ -3,9 +3,11 @@
 use std::path::Path;
 
 use ort::session::Session;
+use ort::value::TensorRef;
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
 
-use crate::clap_model::Embedding;
+use crate::audio::validate_shape;
+use crate::clap_model::{Embedding, NORM_BUDGET};
 use crate::error::{Error, Result};
 use crate::options::Options;
 
@@ -15,24 +17,19 @@ use crate::options::Options;
 const TEXT_INPUT_IDS_NAME: &str = "input_ids";
 const TEXT_OUTPUT_NAME: &str = "text_embeds";
 
-#[allow(dead_code)] // Used by Task 23 finalize_embedding.
 const TEXT_OUTPUT_IS_UNIT_NORM: bool = false;
 
-#[allow(dead_code)] // Used by Task 23.
 const EMBEDDING_DIM: usize = 512;
 
 /// Text encoder. See spec §7.4.
 pub struct TextEncoder {
-  #[allow(dead_code)] // Used by Tasks 23-24.
   session: Session,
-  #[allow(dead_code)] // Used by Tasks 23-24.
   tokenizer: Tokenizer,
   /// Cached at construction. Reserved for future exports that externalize position_ids
   /// (the Xenova export inlines it; pad_id is the diagnostic source of truth here).
   #[allow(dead_code)] // Used if §3.2 externalizes position_ids; preserved for diagnostic/reflection.
   pad_id: i64,
   /// Reused scratch for input_ids tensor binding.
-  #[allow(dead_code)] // Used by Tasks 23-24.
   ids_scratch: Vec<i64>,
 }
 
@@ -164,9 +161,54 @@ impl TextEncoder {
     })
   }
 
-  /// Embed a single text query.
-  pub fn embed(&mut self, _text: &str) -> Result<Embedding> {
-    unimplemented!("TextEncoder::embed — implemented in Task 23")
+  /// Embed a single text query. See spec §7.4 / §9.2.
+  pub fn embed(&mut self, text: &str) -> Result<Embedding> {
+    if text.is_empty() {
+      return Err(Error::EmptyInput { batch_index: None });
+    }
+    let encoding = self
+      .tokenizer
+      .encode(text, true)
+      .map_err(Error::Tokenize)?;
+    let t = encoding.get_ids().len();
+
+    // Resize scratch + cast u32 → i64.
+    self.ids_scratch.clear();
+    self.ids_scratch.reserve(t);
+    for &id in encoding.get_ids() {
+      self.ids_scratch.push(id as i64);
+    }
+
+    // Bind tensor view — Phase A: only input_ids is externalized; attention_mask is inlined.
+    let ids_view = TensorRef::from_array_view(([1usize, t], self.ids_scratch.as_slice()))?;
+
+    let outputs = self.session.run(ort::inputs![
+      TEXT_INPUT_IDS_NAME => ids_view,
+    ])?;
+
+    let (shape, data) = outputs[TEXT_OUTPUT_NAME].try_extract_tensor::<f32>()?;
+    validate_shape("text_output", shape.as_ref(), &[1, EMBEDDING_DIM as i64])?;
+
+    let mut row = [0.0f32; EMBEDDING_DIM];
+    row.copy_from_slice(&data[..EMBEDDING_DIM]);
+    Self::finalize_embedding(row)
+  }
+
+  /// Convert a raw projection row into a unit-norm `Embedding`. Branch identical to audio side
+  /// (see `src/audio.rs::finalize_embedding`).
+  fn finalize_embedding(row: [f32; 512]) -> Result<Embedding> {
+    if TEXT_OUTPUT_IS_UNIT_NORM {
+      let norm_sq: f32 = row.iter().map(|x| x * x).sum();
+      let dev = (norm_sq - 1.0).abs();
+      if dev > NORM_BUDGET {
+        return Err(Error::EmbeddingNotUnitNorm {
+          norm_sq_deviation: dev,
+        });
+      }
+      Ok(Embedding::from_array_trusted_unit_norm(row))
+    } else {
+      Embedding::from_slice_normalizing(&row)
+    }
   }
 
   /// Embed a batch of text queries.
