@@ -122,7 +122,19 @@ use rustfft::num_complex::Complex;
 /// when no SIMD backend is available.
 ///
 /// See [`scalar::power_spectrum_into`] for the full semantic specification.
+///
+/// # Panics
+///
+/// Panics in both debug and release if `buf.len() != out.len()`. The unsafe
+/// SIMD backends rely on equal lengths for raw pointer arithmetic; the
+/// release-mode assertion guards against any future internal caller
+/// triggering out-of-bounds reads/writes.
 pub(crate) fn power_spectrum_into(buf: &[Complex<f64>], out: &mut [f64]) {
+  assert_eq!(
+    buf.len(),
+    out.len(),
+    "power_spectrum_into requires buf.len() == out.len()"
+  );
   cfg_select! {
     target_arch = "aarch64" => {
       if neon_available() {
@@ -167,7 +179,19 @@ pub(crate) fn power_spectrum_into(buf: &[Complex<f64>], out: &mut [f64]) {
 /// backend is available.
 ///
 /// See [`scalar::mel_filterbank_dot`] for the full semantic specification.
+///
+/// # Panics
+///
+/// Panics in both debug and release if `weights.len() != power.len()`. The
+/// unsafe SIMD backends rely on equal lengths for raw pointer arithmetic;
+/// the release-mode assertion guards against any future internal caller
+/// triggering out-of-bounds reads.
 pub(crate) fn mel_filterbank_dot(weights: &[f64], power: &[f64]) -> f64 {
+  assert_eq!(
+    weights.len(),
+    power.len(),
+    "mel_filterbank_dot requires weights.len() == power.len()"
+  );
   cfg_select! {
     target_arch = "aarch64" => {
       if neon_available() {
@@ -515,5 +539,21 @@ mod tests {
       s[hit] = f32::NAN;
       assert_eq!(first_non_finite(&s), Some(hit), "hit={hit}");
     }
+  }
+
+  #[test]
+  #[should_panic(expected = "power_spectrum_into requires buf.len() == out.len()")]
+  fn power_spectrum_into_rejects_mismatched_lengths() {
+    let buf = vec![Complex::new(1.0_f64, 0.0); 4];
+    let mut out = vec![0.0f64; 5]; // intentionally one longer
+    power_spectrum_into(&buf, &mut out);
+  }
+
+  #[test]
+  #[should_panic(expected = "mel_filterbank_dot requires weights.len() == power.len()")]
+  fn mel_filterbank_dot_rejects_mismatched_lengths() {
+    let weights = vec![0.5f64; 4];
+    let power = vec![2.0f64; 5]; // intentionally one longer
+    let _ = mel_filterbank_dot(&weights, &power);
   }
 }
