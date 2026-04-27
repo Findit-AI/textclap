@@ -16,3 +16,12 @@
 
 /target
 Cargo.lock
+
+**.venv/
+**.claude/
+**docs/
+
+# ONNX model files — large (33 MB + 121 MB), licensed separately, not bundled with the crate
+*.onnx
+
+**docs/

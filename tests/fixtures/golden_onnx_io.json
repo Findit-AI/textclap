@@ -1,0 +1,39 @@
+{
+  "audio_input_name": "input_features",
+  "audio_input_shape": [
+    "?",
+    "?",
+    "?",
+    "?"
+  ],
+  "audio_output_name": "audio_embeds",
+  "audio_output_shape": [
+    "?",
+    512
+  ],
+  "audio_output_is_unit_norm": false,
+  "audio_last_5_ops": [
+    "Mul",
+    "MatMulInteger",
+    "Cast",
+    "Mul",
+    "Add"
+  ],
+  "text_input_ids_name": "input_ids",
+  "text_attention_mask_name": null,
+  "text_position_ids_name": null,
+  "text_output_name": "text_embeds",
+  "text_output_shape": [
+    "?",
+    512
+  ],
+  "text_output_is_unit_norm": false,
+  "text_last_5_ops": [
+    "Mul",
+    "MatMulInteger",
+    "Cast",
+    "Mul",
+    "Add"
+  ],
+  "text_pad_id": 1
+}
