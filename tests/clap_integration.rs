@@ -5,7 +5,7 @@
 
 use std::{env, path::PathBuf};
 
-use textclap::{Clap, Embedding, Options};
+use textclap::{ChunkingOptions, Clap, Embedding, Options};
 
 fn models_dir() -> Option<PathBuf> {
   env::var_os("TEXTCLAP_MODELS_DIR").map(PathBuf::from)
@@ -104,6 +104,34 @@ fn text_embeddings_match_golden() {
       "text embedding cosine drift exceeds 5e-8 for label {label:?}",
     );
   }
+}
+
+/// Regression for the Codex finding: `embed_chunked` previously accepted any positive
+/// window, including windows > TARGET_SAMPLES which `MelExtractor` silently head-truncated
+/// to 10 s, dropping audio after the first window. The validation guard now rejects
+/// `window_samples > 480_000`.
+#[test]
+fn embed_chunked_rejects_oversize_window_runtime() {
+  let Some(dir) = models_dir() else {
+    eprintln!("skipping: TEXTCLAP_MODELS_DIR not set");
+    return;
+  };
+  let mut clap = Clap::from_files(
+    dir.join("audio_model_quantized.onnx"),
+    dir.join("text_model_quantized.onnx"),
+    dir.join("tokenizer.json"),
+    Options::new(),
+  )
+  .expect("Clap::from_files");
+  let samples = vec![0.0f32; 480_000];
+  let opts = ChunkingOptions::new()
+    .with_window_samples(480_001)
+    .with_hop_samples(480_001)
+    .with_batch_size(1);
+  let err = clap.audio_mut().embed_chunked(&samples, &opts).unwrap_err();
+  // ChunkingConfig variant should fire.
+  let msg = format!("{err}");
+  assert!(msg.contains("invalid chunking options"), "unexpected error: {msg}");
 }
 
 /// Regression for the Codex finding: `from_ort_session` preserves the caller's padding
