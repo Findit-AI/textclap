@@ -297,6 +297,19 @@ impl Clap {
     Ok(Self { audio, text })
   }
 
+  /// Load both encoders from ONNX files using the crate's bundled tokenizer.
+  /// Simplest constructor for typical use; users only need to supply the two
+  /// ONNX files. See `crate::BUNDLED_TOKENIZER` for the pinned tokenizer source.
+  pub fn from_onnx_files<P: AsRef<Path>>(
+    audio_onnx: P,
+    text_onnx: P,
+    opts: Options,
+  ) -> Result<Self> {
+    let audio = AudioEncoder::from_file(audio_onnx, opts)?;
+    let text = TextEncoder::from_onnx_file(text_onnx, opts)?;
+    Ok(Self { audio, text })
+  }
+
   /// Load from caller-supplied bytes.
   pub fn from_memory(
     audio_bytes: &[u8],

@@ -33,3 +33,10 @@ pub use crate::{
   options::{ChunkingOptions, GraphOptimizationLevel, Options},
   text::TextEncoder,
 };
+
+/// Bytes of the pinned Xenova `tokenizer.json` shipped with the crate (~2 MB).
+/// SHA256 verified in CI against `models/MODELS.sha256`. Exposed for callers who
+/// want to construct the encoders via `from_memory`; for typical use, prefer the
+/// bundled-tokenizer constructors `Clap::from_onnx_files` and
+/// `TextEncoder::from_onnx_file`.
+pub const BUNDLED_TOKENIZER: &[u8] = include_bytes!("../models/tokenizer.json");

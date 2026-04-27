@@ -136,6 +136,34 @@ impl TextEncoder {
     Self::from_pieces(session, tokenizer, pad_id)
   }
 
+  /// Load from an ONNX file path using the crate's bundled tokenizer.
+  /// Equivalent to `from_files(onnx_path, "<bundled>", opts)` but with no separate
+  /// tokenizer file required. See `crate::BUNDLED_TOKENIZER` for the pinned bytes.
+  pub fn from_onnx_file<P: AsRef<Path>>(onnx_path: P, opts: Options) -> Result<Self> {
+    let onnx = onnx_path.as_ref();
+    let session = Session::builder()
+      .map_err(|source| Error::OnnxLoadFromFile {
+        path: onnx.to_path_buf(),
+        source,
+      })?
+      .with_optimization_level(opts.optimization_level())
+      .map_err(|source| Error::OnnxLoadFromFile {
+        path: onnx.to_path_buf(),
+        source: ort::Error::from(source),
+      })?
+      .commit_from_file(onnx)
+      .map_err(|source| Error::OnnxLoadFromFile {
+        path: onnx.to_path_buf(),
+        source,
+      })?;
+    let mut tokenizer = Tokenizer::from_bytes(crate::BUNDLED_TOKENIZER)
+      .map_err(Error::TokenizerLoadFromMemory)?;
+    let pad_id = resolve_pad_id(&tokenizer)?;
+    force_batch_longest_padding(&mut tokenizer, pad_id);
+    force_max_length_truncation(&mut tokenizer)?;
+    Self::from_pieces(session, tokenizer, pad_id)
+  }
+
   /// Load from caller-supplied bytes.
   pub fn from_memory(
     onnx_bytes: &[u8],

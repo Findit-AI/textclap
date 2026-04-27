@@ -243,6 +243,43 @@ fn embed_truncates_overlong_text() {
   assert_eq!(emb.dim(), 512);
 }
 
+/// Regression for the bundled-tokenizer path: Clap::from_onnx_files (using the
+/// crate's BUNDLED_TOKENIZER) must produce embeddings matching Clap::from_files
+/// (using the on-disk tokenizer.json). The bundled bytes are SHA256-pinned to the
+/// same source.
+#[test]
+fn from_onnx_files_matches_from_files() {
+  let Some(dir) = models_dir() else {
+    eprintln!("skipping: TEXTCLAP_MODELS_DIR not set");
+    return;
+  };
+
+  let mut bundled = textclap::Clap::from_onnx_files(
+    dir.join("audio_model_quantized.onnx"),
+    dir.join("text_model_quantized.onnx"),
+    textclap::Options::new(),
+  )
+  .expect("from_onnx_files");
+
+  let mut explicit = textclap::Clap::from_files(
+    dir.join("audio_model_quantized.onnx"),
+    dir.join("text_model_quantized.onnx"),
+    dir.join("tokenizer.json"),
+    textclap::Options::new(),
+  )
+  .expect("from_files");
+
+  // Same query through both constructors should produce identical embeddings
+  // (same tokenizer bytes ⇒ same encode ⇒ same ONNX run ⇒ same output).
+  let q = "a dog barking";
+  let a = bundled.text_mut().embed(q).expect("bundled embed");
+  let b = explicit.text_mut().embed(q).expect("explicit embed");
+  assert!(
+    a.is_close(&b, 1e-7),
+    "bundled vs explicit tokenizer drift exceeds 1e-7"
+  );
+}
+
 #[test]
 fn classify_discrimination_check() {
   let Some(dir) = models_dir() else {
