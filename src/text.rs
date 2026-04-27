@@ -26,9 +26,10 @@ const EMBEDDING_DIM: usize = 512;
 pub struct TextEncoder {
   session: Session,
   tokenizer: Tokenizer,
-  /// Cached at construction. Used by `embed_batch` to right-pad uneven encodings to the true
-  /// `t_max` so the input tensor shape `[n, t_max]` is well-formed regardless of the upstream
-  /// tokenizer padding strategy. Also reserved for future exports that externalize position_ids.
+  /// Cached at construction. Reserved for future exports that externalize `attention_mask` /
+  /// `position_ids`; the current Xenova export inlines both, so `embed_batch` dispatches per-text
+  /// (no batched ORT call) and `pad_id` is not load-bearing in the hot path. See `embed_batch`.
+  #[allow(dead_code)]
   pad_id: i64,
   /// Reused scratch for input_ids tensor binding.
   ids_scratch: Vec<i64>,
@@ -46,8 +47,11 @@ fn resolve_pad_id(tokenizer: &Tokenizer) -> Result<i64> {
   Err(Error::NoPadToken)
 }
 
-/// Force `BatchLongest` padding on the tokenizer regardless of what the JSON declared.
-/// Used by `from_files` / `from_memory`. See spec §7.4.
+/// Force `BatchLongest` padding on the tokenizer, regardless of what the JSON declared.
+/// Used by `from_files` / `from_memory` as a tokenizer-side hint, even though `embed_batch`
+/// processes texts per-label rather than batching them through ORT (see `embed_batch` doc).
+/// Kept for forward-compat with future exports that consume an externalized attention_mask.
+/// See spec §7.4.
 fn force_batch_longest_padding(tokenizer: &mut Tokenizer, pad_id: i64) {
   let pad_token = tokenizer
     .id_to_token(pad_id as u32)
@@ -208,71 +212,28 @@ impl TextEncoder {
     }
   }
 
-  /// Embed a batch of text queries. Padding is `BatchLongest` (forced at construction).
-  /// See spec §7.4 / §9.2.
+  /// Embed a batch of text queries. Each text is encoded **independently** through `embed`,
+  /// producing an embedding equivalent to calling `embed(text)` per text.
+  ///
+  /// Why per-text rather than a single ORT call: the Xenova export inlines attention_mask /
+  /// position_ids derivation, and empirically does not perfectly mask pad tokens. Batched ORT
+  /// runs produce embeddings that depend on batch composition (a label's embedding shifts when
+  /// batched with a longer label). Per-text dispatch trades ~10× ORT calls for batch-invariant
+  /// semantics, which `classify_*` requires for correctness. See spec §7.4 / §9.2.
   pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Embedding>> {
     if texts.is_empty() {
       return Ok(Vec::new());
     }
-    for (i, t) in texts.iter().enumerate() {
-      if t.is_empty() {
+    // Per-text validation is performed by `embed`. We loop here so the empty-text error
+    // index reflects the batch position, not the single-clip None.
+    let mut out = Vec::with_capacity(texts.len());
+    for (i, text) in texts.iter().enumerate() {
+      if text.is_empty() {
         return Err(Error::EmptyInput {
           batch_index: Some(i),
         });
       }
-    }
-
-    // `from_files` / `from_memory` install `BatchLongest` to make rows uniform, but
-    // `from_ort_session` preserves whatever padding the caller configured (only `Fixed` is
-    // rejected). Don't rely on encoded-row uniformity — compute the true `t_max` across all
-    // rows and explicitly right-pad short rows with `pad_id` so the `[n, t_max]` tensor shape
-    // is correct by construction. `force_batch_longest_padding` remains a useful hint to the
-    // tokenizer, but this loop is what guarantees the shape contract.
-    let encodings = self
-      .tokenizer
-      .encode_batch(texts.to_vec(), true)
-      .map_err(Error::Tokenize)?;
-
-    let n = encodings.len();
-    let t_max = encodings
-      .iter()
-      .map(|e| e.get_ids().len())
-      .max()
-      .unwrap_or(0);
-    // Empty-batch was short-circuited above; t_max is at least the longest non-empty encoding.
-    debug_assert!(t_max > 0);
-
-    self.ids_scratch.clear();
-    self.ids_scratch.reserve(n * t_max);
-    for enc in &encodings {
-      let ids = enc.get_ids();
-      for &id in ids {
-        self.ids_scratch.push(id as i64);
-      }
-      // Right-pad to t_max with pad_id so the [n, t_max] tensor is well-formed
-      // regardless of the upstream padding strategy.
-      for _ in ids.len()..t_max {
-        self.ids_scratch.push(self.pad_id);
-      }
-    }
-
-    let ids_view = TensorRef::from_array_view(([n, t_max], self.ids_scratch.as_slice()))?;
-
-    let outputs = self.session.run(ort::inputs![
-      TEXT_INPUT_IDS_NAME => ids_view,
-    ])?;
-    let (shape, data) = outputs[TEXT_OUTPUT_NAME].try_extract_tensor::<f32>()?;
-    validate_shape(
-      "text_output",
-      shape.as_ref(),
-      &[n as i64, EMBEDDING_DIM as i64],
-    )?;
-
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-      let mut row = [0.0f32; EMBEDDING_DIM];
-      row.copy_from_slice(&data[i * EMBEDDING_DIM..(i + 1) * EMBEDDING_DIM]);
-      out.push(Self::finalize_embedding(row)?);
+      out.push(self.embed(text)?);
     }
     Ok(out)
   }

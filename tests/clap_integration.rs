@@ -172,6 +172,44 @@ fn from_ort_session_uneven_lengths_no_padding() {
   }
 }
 
+/// Regression for the Codex round-2 finding: embed_batch must produce embeddings that match
+/// per-label embed exactly, so classify_* scores don't depend on batch composition. This is
+/// the inverse of the round-1 from_ort_session_uneven_lengths_no_padding test (which verified
+/// embed_batch tolerates uneven lengths) — here we verify embed_batch is *semantically*
+/// equivalent to per-label embed.
+#[test]
+fn embed_batch_matches_per_label_embed() {
+  let Some(dir) = models_dir() else {
+    eprintln!("skipping: TEXTCLAP_MODELS_DIR not set");
+    return;
+  };
+  let mut clap = textclap::Clap::from_files(
+    dir.join("audio_model_quantized.onnx"),
+    dir.join("text_model_quantized.onnx"),
+    dir.join("tokenizer.json"),
+    textclap::Options::new(),
+  )
+  .expect("Clap::from_files");
+  clap.warmup().expect("warmup");
+
+  let labels = ["a dog barking", "rain", "music", "silence", "door creaking"];
+  let batched = clap.text_mut().embed_batch(&labels).expect("embed_batch");
+  let per_label: Vec<textclap::Embedding> = labels
+    .iter()
+    .map(|t| clap.text_mut().embed(t).expect("embed"))
+    .collect();
+  assert_eq!(batched.len(), per_label.len());
+  for (i, (b, p)) in batched.iter().zip(per_label.iter()).enumerate() {
+    // Tolerance matches the per-label golden tolerance.
+    assert!(
+      b.is_close(p, 1e-5),
+      "batch[{i}] != per-label embed for {label:?}",
+      label = labels[i]
+    );
+    assert!(b.is_close_cosine(p, 5e-8), "batch[{i}] cosine drift for {:?}", labels[i]);
+  }
+}
+
 #[test]
 fn classify_discrimination_check() {
   let Some(dir) = models_dir() else {
