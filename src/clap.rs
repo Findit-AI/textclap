@@ -122,17 +122,17 @@ impl Embedding {
       return Err(Error::EmbeddingZero);
     }
     let inv_norm_f64 = 1.0_f64 / norm_sq_f64.sqrt();
-    // Cast to f32 for the per-component multiply. If norm_sq is so large that
-    // 1/sqrt(norm_sq) is below f32::MIN_POSITIVE (~1.18e-38), the cast collapses to
-    // zero and normalization degenerates. Reject as `EmbeddingZero` — the magnitude
-    // exceeds what f32 can normalize.
-    let inv_norm = inv_norm_f64 as f32;
-    if inv_norm == 0.0 || !inv_norm.is_finite() {
-      return Err(Error::EmbeddingZero);
-    }
+    // Multiply per-component in f64, then cast to f32. Casting inv_norm to f32 first
+    // would overflow to +Inf for subnormal-magnitude inputs (e.g. f32::from_bits(1)
+    // ≈ 1.4e-45 ⇒ inv_norm_f64 ≈ 7e44, well above f32::MAX). Doing the multiply in
+    // f64 ensures any finite nonzero input normalizes to a valid unit vector.
+    debug_assert!(
+      inv_norm_f64.is_finite(),
+      "f64 inv_norm should be finite after rejecting norm_sq == 0"
+    );
     let mut inner = [0.0f32; 512];
     for (out, &v) in inner.iter_mut().zip(s.iter()) {
-      *out = v * inv_norm;
+      *out = ((v as f64) * inv_norm_f64) as f32;
     }
     Ok(Self { inner })
   }
@@ -506,6 +506,24 @@ mod tests {
       (norm_sq - 1.0).abs() < 1e-4,
       "result not unit-norm: norm_sq = {norm_sq}"
     );
+  }
+
+  #[test]
+  fn from_slice_normalizing_handles_smallest_subnormal() {
+    // Codex round-4 regression: a vector with a single subnormal-magnitude component
+    // is mathematically normalizable to a unit vector along that axis. The previous
+    // round (f32 inv_norm cast) overflowed to +Inf and incorrectly rejected as
+    // EmbeddingZero. The f64-throughout fix produces the correct unit vector.
+    let mut s = [0.0f32; 512];
+    s[0] = f32::from_bits(1); // smallest positive subnormal, ~1.4e-45
+    let e = Embedding::from_slice_normalizing(&s).expect("subnormal-magnitude must normalize");
+    let head = e.as_slice()[0];
+    assert!(
+      (head - 1.0).abs() < 1e-6,
+      "expected unit vector along axis 0; got head[0] = {head}"
+    );
+    let norm_sq: f32 = e.as_slice().iter().map(|x| x * x).sum();
+    assert!((norm_sq - 1.0).abs() < 1e-4, "result not unit-norm: norm_sq = {norm_sq}");
   }
 
   #[test]
