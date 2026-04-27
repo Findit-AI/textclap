@@ -23,11 +23,6 @@ mod clap;
 mod error;
 mod mel;
 mod options;
-// Dead-code is permitted while the SIMD scaffold (Task SIMD-1) lands without
-// call-site rewiring. Tasks SIMD-2 through SIMD-5 fill in the kernels and
-// switch `mel.rs` / `audio.rs` over to the dispatchers, at which point the
-// scalar reference, dispatchers, and per-arch backends all become live.
-#[allow(dead_code)]
 mod simd;
 mod text;
 

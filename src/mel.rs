@@ -157,10 +157,8 @@ impl MelExtractor {
       .map(|(&s, &w)| Complex::<f64>::new(s * w, 0.0))
       .collect();
     self.fft.process(&mut buf);
-    for k in 0..(N_FFT / 2 + 1) {
-      let c = buf[k];
-      power[k] = c.re * c.re + c.im * c.im;
-    }
+    // Use only the first N_FFT/2 + 1 bins (real-FFT identity); discard the conjugate symmetric tail.
+    crate::simd::power_spectrum_into(&buf[..N_FFT / 2 + 1], power);
   }
 
   /// Compute mel features and write into `out`. Caller must size `out` to exactly `T_FRAMES * 64`
@@ -219,10 +217,7 @@ impl MelExtractor {
       // ref=1.0, amin=1e-10 ⇒ floor at -100 dB; matches HF `power_to_db`).
       for mel_bin in 0..N_MELS {
         let row = &self.filterbank[mel_bin * (N_FFT / 2 + 1)..(mel_bin + 1) * (N_FFT / 2 + 1)];
-        let mut acc = 0.0f64;
-        for (w, p) in row.iter().zip(power.iter()) {
-          acc += w * p;
-        }
+        let acc = crate::simd::mel_filterbank_dot(row, &power);
         let clipped = acc.max(POWER_TO_DB_AMIN);
         let db = 10.0 * clipped.log10();
         // 6. Time-major output: out[t * 64 + mel_bin]

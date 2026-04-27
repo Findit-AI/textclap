@@ -338,12 +338,7 @@ impl AudioEncoder {
   /// SIMD-friendly finiteness scan. Returns `Some(index)` of the first non-finite sample, or `None`.
   /// Cost ~50 µs over 480 000 samples — dwarfed by ONNX inference.
   fn first_non_finite(samples: &[f32]) -> Option<usize> {
-    for (i, &v) in samples.iter().enumerate() {
-      if !v.is_finite() {
-        return Some(i);
-      }
-    }
-    None
+    crate::simd::first_non_finite(samples)
   }
 
   /// Convert a raw projection row into a unit-norm `Embedding`. See spec §8.2 step 5.
