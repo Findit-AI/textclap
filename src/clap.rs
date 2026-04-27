@@ -78,6 +78,11 @@ impl Embedding {
         got: s.len(),
       });
     }
+    for (i, &v) in s.iter().enumerate() {
+      if !v.is_finite() {
+        return Err(Error::NonFiniteEmbedding { component_index: i });
+      }
+    }
     let norm_sq: f32 = s.iter().map(|x| x * x).sum();
     let dev = (norm_sq - 1.0).abs();
     if dev > NORM_BUDGET {
@@ -457,6 +462,43 @@ mod tests {
     let target_sq = 1.0 + 0.5 * NORM_BUDGET;
     s[0] = target_sq.sqrt();
     Embedding::try_from_unit_slice(&s).expect("inclusive ≤ should accept boundary value");
+  }
+
+  #[test]
+  fn try_from_unit_slice_rejects_nan() {
+    let mut s = [0.0f32; 512];
+    s[0] = (1.0_f32 / 512.0_f32).sqrt(); // would be unit-norm if all set
+    for v in s.iter_mut().take(512) {
+      *v = (1.0_f32 / 512.0_f32).sqrt();
+    }
+    s[37] = f32::NAN;
+    let err = Embedding::try_from_unit_slice(&s).unwrap_err();
+    assert!(
+      matches!(err, Error::NonFiniteEmbedding { component_index: 37 }),
+      "got {err:?}"
+    );
+  }
+
+  #[test]
+  fn try_from_unit_slice_rejects_positive_infinity() {
+    let mut s = [0.0f32; 512];
+    for v in s.iter_mut() {
+      *v = (1.0_f32 / 512.0_f32).sqrt();
+    }
+    s[100] = f32::INFINITY;
+    let err = Embedding::try_from_unit_slice(&s).unwrap_err();
+    assert!(matches!(err, Error::NonFiniteEmbedding { component_index: 100 }));
+  }
+
+  #[test]
+  fn try_from_unit_slice_rejects_negative_infinity_at_zero() {
+    let mut s = [0.0f32; 512];
+    for v in s.iter_mut() {
+      *v = (1.0_f32 / 512.0_f32).sqrt();
+    }
+    s[0] = f32::NEG_INFINITY;
+    let err = Embedding::try_from_unit_slice(&s).unwrap_err();
+    assert!(matches!(err, Error::NonFiniteEmbedding { component_index: 0 }));
   }
 
   #[test]
