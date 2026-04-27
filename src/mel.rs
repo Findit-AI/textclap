@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Mel time-frame count. Backfilled from `golden_params.json["T_frames"]` per §3.4.
 pub(crate) const T_FRAMES: usize = 1001;
@@ -181,6 +181,15 @@ impl MelExtractor {
   /// `waveform.astype(np.float64)` before STFT). Only the final dB output is cast back to f32.
   pub(crate) fn extract_into(&mut self, samples: &[f32], out: &mut [f32]) -> Result<()> {
     debug_assert_eq!(out.len(), N_MELS * T_FRAMES);
+
+    // Reject empty input explicitly. Public callers (embed / embed_batch /
+    // embed_chunked) already validate non-empty input, but this pub(crate)
+    // function returns Result and shouldn't rely on that — without this guard
+    // the repeat-pad branch would divide by samples.len() and panic with
+    // arithmetic overflow on an empty slice.
+    if samples.is_empty() {
+      return Err(Error::EmptyAudio { clip_index: None });
+    }
 
     // 1. Repeat-pad or head-truncate to TARGET_SAMPLES, mirroring HF `repeatpad`:
     //   n_repeat = floor(max_length / len(waveform)); waveform = tile(waveform, n_repeat)
@@ -411,6 +420,19 @@ mod tests {
     assert!(
       (-100.0 - 1e-3..-50.0).contains(&min),
       "amin floor should clip silent bins to -100 dB; got min = {min}",
+    );
+  }
+
+  /// Empty input must be rejected explicitly with `Error::EmptyAudio` rather
+  /// than panicking via `TARGET_SAMPLES / 0` in the repeat-pad branch.
+  #[test]
+  fn extract_into_rejects_empty_input() {
+    let mut mel = MelExtractor::new();
+    let mut out = vec![0.0f32; N_MELS * T_FRAMES];
+    let err = mel.extract_into(&[], &mut out).unwrap_err();
+    assert!(
+      matches!(err, Error::EmptyAudio { clip_index: None }),
+      "expected Error::EmptyAudio {{ clip_index: None }}, got {err:?}",
     );
   }
 }
