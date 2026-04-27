@@ -48,7 +48,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: textclap-${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.lock') }}
+          key: textclap-${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             textclap-${{ runner.os }}-clippy-
       - run: cargo clippy --all-targets ${{ matrix.features }}
@@ -76,7 +76,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: textclap-${{ runner.os }}-build-test-${{ hashFiles('**/Cargo.lock') }}
+          key: textclap-${{ runner.os }}-build-test-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             textclap-${{ runner.os }}-build-test-
       - run: cargo build --verbose
@@ -94,7 +94,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: textclap-${{ runner.os }}-doctest-${{ hashFiles('**/Cargo.lock') }}
+          key: textclap-${{ runner.os }}-doctest-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             textclap-${{ runner.os }}-doctest-
       - run: cargo test --doc --all-features
@@ -125,7 +125,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: textclap-${{ runner.os }}-cross-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: textclap-${{ runner.os }}-cross-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             textclap-${{ runner.os }}-cross-${{ matrix.target }}-
       - uses: dtolnay/rust-toolchain@stable
@@ -170,7 +170,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: textclap-${{ runner.os }}-test-sde-${{ hashFiles('**/Cargo.lock') }}
+          key: textclap-${{ runner.os }}-test-sde-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             textclap-${{ runner.os }}-test-sde-
       - uses: dtolnay/rust-toolchain@stable
@@ -222,7 +222,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: textclap-${{ runner.os }}-miri-tb-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: textclap-${{ runner.os }}-miri-tb-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             textclap-${{ runner.os }}-miri-tb-${{ matrix.target }}-
       - name: Miri (tree-borrows)
@@ -246,7 +246,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: textclap-${{ runner.os }}-miri-sb-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: textclap-${{ runner.os }}-miri-sb-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             textclap-${{ runner.os }}-miri-sb-${{ matrix.target }}-
       - name: Miri (stacked-borrows)
