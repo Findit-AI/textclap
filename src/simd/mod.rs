@@ -135,3 +135,83 @@ fn avx2_fma_available() -> bool {
   }
   std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use rustfft::num_complex::Complex;
+
+  fn run_dispatch(buf: &[Complex<f64>]) -> Vec<f64> {
+    let mut out = vec![0.0f64; buf.len()];
+    power_spectrum_into(buf, &mut out);
+    out
+  }
+
+  fn run_scalar(buf: &[Complex<f64>]) -> Vec<f64> {
+    let mut out = vec![0.0f64; buf.len()];
+    scalar::power_spectrum_into(buf, &mut out);
+    out
+  }
+
+  /// Deterministic LCG so the equivalence tests don't depend on a
+  /// platform-specific RNG. Constants are the standard MMIX values.
+  fn make_input(n: usize, seed: u64) -> Vec<Complex<f64>> {
+    let mut s = seed;
+    (0..n)
+      .map(|_| {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let re = ((s >> 33) as i32 as f64) / i32::MAX as f64;
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let im = ((s >> 33) as i32 as f64) / i32::MAX as f64;
+        Complex::new(re, im)
+      })
+      .collect()
+  }
+
+  #[test]
+  fn power_spectrum_simd_matches_scalar_513() {
+    // Real call site uses N_FFT/2+1 = 513 (odd), so the kernel's tail
+    // path runs in production. Cover it here.
+    let input = make_input(513, 0xDEADBEEF);
+    let dispatched = run_dispatch(&input);
+    let reference = run_scalar(&input);
+    assert_eq!(dispatched.len(), reference.len());
+    for (i, (a, b)) in dispatched.iter().zip(reference.iter()).enumerate() {
+      // Bit-identical for re*re + im*im since SIMD multiplies are
+      // exact (no FMA reassoc in this kernel).
+      assert!(
+        (a - b).abs() <= 1e-15,
+        "mismatch at {i}: simd={a} scalar={b}"
+      );
+    }
+  }
+
+  #[test]
+  fn power_spectrum_simd_matches_scalar_even_512() {
+    // Pure SIMD path with no tail.
+    let input = make_input(512, 0xCAFEF00D);
+    let dispatched = run_dispatch(&input);
+    let reference = run_scalar(&input);
+    for (a, b) in dispatched.iter().zip(reference.iter()) {
+      assert!((a - b).abs() <= 1e-15);
+    }
+  }
+
+  #[test]
+  fn power_spectrum_empty() {
+    let input: Vec<Complex<f64>> = Vec::new();
+    let mut out: Vec<f64> = Vec::new();
+    power_spectrum_into(&input, &mut out);
+    assert!(out.is_empty());
+  }
+
+  #[test]
+  fn power_spectrum_one() {
+    // 3-4-5 right triangle: 3² + 4² == 25. Catches a kernel that
+    // skips the tail when n_pairs == 0.
+    let input = vec![Complex::new(3.0, 4.0)];
+    let mut out = vec![0.0f64; 1];
+    power_spectrum_into(&input, &mut out);
+    assert_eq!(out, vec![25.0]);
+  }
+}
