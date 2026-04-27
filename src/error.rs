@@ -99,7 +99,9 @@ pub enum Error {
   },
 
   /// Chunking options have an invalid value.
-  #[error("invalid chunking options: window={window_samples}, hop={hop_samples}, batch={batch_size}; all must be > 0, hop ≤ window, and window ≤ 480000 samples (10 s @ 48 kHz)")]
+  #[error(
+    "invalid chunking options: window={window_samples}, hop={hop_samples}, batch={batch_size}; all must be > 0, hop ≤ window, and window ≤ 480000 samples (10 s @ 48 kHz)"
+  )]
   ChunkingConfig {
     /// Window length in samples.
     window_samples: usize,
