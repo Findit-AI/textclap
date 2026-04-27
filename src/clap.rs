@@ -523,7 +523,10 @@ mod tests {
       "expected unit vector along axis 0; got head[0] = {head}"
     );
     let norm_sq: f32 = e.as_slice().iter().map(|x| x * x).sum();
-    assert!((norm_sq - 1.0).abs() < 1e-4, "result not unit-norm: norm_sq = {norm_sq}");
+    assert!(
+      (norm_sq - 1.0).abs() < 1e-4,
+      "result not unit-norm: norm_sq = {norm_sq}"
+    );
   }
 
   #[test]
