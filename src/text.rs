@@ -26,10 +26,9 @@ const EMBEDDING_DIM: usize = 512;
 pub struct TextEncoder {
   session: Session,
   tokenizer: Tokenizer,
-  /// Cached at construction. Reserved for future exports that externalize position_ids
-  /// (the Xenova export inlines it; pad_id is the diagnostic source of truth here).
-  #[allow(dead_code)]
-  // Used if §3.2 externalizes position_ids; preserved for diagnostic/reflection.
+  /// Cached at construction. Used by `embed_batch` to right-pad uneven encodings to the true
+  /// `t_max` so the input tensor shape `[n, t_max]` is well-formed regardless of the upstream
+  /// tokenizer padding strategy. Also reserved for future exports that externalize position_ids.
   pad_id: i64,
   /// Reused scratch for input_ids tensor binding.
   ids_scratch: Vec<i64>,
@@ -223,21 +222,33 @@ impl TextEncoder {
       }
     }
 
-    // BatchLongest padding installed at construction makes all encoded rows the same length.
+    // `from_files` / `from_memory` install `BatchLongest` to make rows uniform, but
+    // `from_ort_session` preserves whatever padding the caller configured (only `Fixed` is
+    // rejected). Don't rely on encoded-row uniformity — compute the true `t_max` across all
+    // rows and explicitly right-pad short rows with `pad_id` so the `[n, t_max]` tensor shape
+    // is correct by construction. `force_batch_longest_padding` remains a useful hint to the
+    // tokenizer, but this loop is what guarantees the shape contract.
     let encodings = self
       .tokenizer
       .encode_batch(texts.to_vec(), true)
       .map_err(Error::Tokenize)?;
 
     let n = encodings.len();
-    let t_max = encodings[0].get_ids().len();
-    debug_assert!(encodings.iter().all(|e| e.get_ids().len() == t_max));
+    let t_max = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+    // Empty-batch was short-circuited above; t_max is at least the longest non-empty encoding.
+    debug_assert!(t_max > 0);
 
     self.ids_scratch.clear();
     self.ids_scratch.reserve(n * t_max);
     for enc in &encodings {
-      for &id in enc.get_ids() {
+      let ids = enc.get_ids();
+      for &id in ids {
         self.ids_scratch.push(id as i64);
+      }
+      // Right-pad to t_max with pad_id so the [n, t_max] tensor is well-formed
+      // regardless of the upstream padding strategy.
+      for _ in ids.len()..t_max {
+        self.ids_scratch.push(self.pad_id);
       }
     }
 

@@ -106,6 +106,44 @@ fn text_embeddings_match_golden() {
   }
 }
 
+/// Regression for the Codex finding: `from_ort_session` preserves the caller's padding
+/// config (or lack thereof). `embed_batch` must still produce a well-formed tensor when
+/// the tokenizer doesn't pad — `ids_scratch` is right-padded to true `t_max` with `pad_id`.
+#[test]
+fn from_ort_session_uneven_lengths_no_padding() {
+  let Some(dir) = models_dir() else {
+    eprintln!("skipping: TEXTCLAP_MODELS_DIR not set");
+    return;
+  };
+
+  // Build a Session manually and a Tokenizer with padding explicitly cleared.
+  use ort::session::Session;
+  let session = Session::builder()
+    .expect("Session::builder")
+    .commit_from_file(dir.join("text_model_quantized.onnx"))
+    .expect("commit_from_file");
+
+  let mut tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
+    .expect("tokenizer load");
+  // Drop any padding configuration to exercise the embed_batch pad-loop's robustness.
+  tokenizer.with_padding(None);
+
+  let mut text = textclap::TextEncoder::from_ort_session(
+    session,
+    tokenizer,
+    textclap::Options::new(),
+  )
+  .expect("from_ort_session");
+
+  // Intentionally uneven lengths: 1 word vs 5 words vs 2 words.
+  let labels = ["rain", "the quick brown fox jumps", "a dog"];
+  let embs = text.embed_batch(&labels).expect("embed_batch");
+  assert_eq!(embs.len(), 3);
+  for emb in &embs {
+    assert_eq!(emb.dim(), 512);
+  }
+}
+
 #[test]
 fn classify_discrimination_check() {
   let Some(dir) = models_dir() else {
