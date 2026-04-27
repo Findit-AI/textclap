@@ -57,11 +57,19 @@ jobs:
             textclap-${{ runner.os }}-clippy-
       - run: cargo clippy --all-targets ${{ matrix.features }}
 
+  # windows-latest excluded from build-test matrix.
+  # The MSVC test binary link step fails with LNK2005 (already-defined symbols) because:
+  #   - ort's prebuilt onnxruntime.dll uses MSVCP140.dll (dynamic CRT, msvcprt.lib)
+  #   - esaxx-rs and onig_sys use libcpmt.lib (static CRT)
+  # Mixing the two CRTs in a single test executable produces hundreds of duplicate
+  # std::* symbol errors. Fixing this requires coordinating CRT flags across the
+  # entire C-FFI dependency graph; out of scope for v0.1.0.
+  # `cargo build --lib` itself succeeds on Windows; only the test binary link fails.
   build-test:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -125,6 +133,16 @@ jobs:
           restore-keys: |
             textclap-${{ runner.os }}-cross-${{ matrix.target }}-
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install cross-compile toolchain
+        run: |
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu)
+              sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+              ;;
+            x86_64-pc-windows-gnu)
+              sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+              ;;
+          esac
       - name: cargo build --target ${{ matrix.target }}
         run: |
           rustup target add ${{ matrix.target }}
@@ -176,6 +194,17 @@ jobs:
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$SDE_PATH/sde64 -icx --"
           cargo test --lib
 
+  # aarch64-apple-darwin excluded from miri matrices.
+  # Miri's NEON intrinsic emulation is incomplete — `llvm.aarch64.neon.faddv.f64.v2f64`
+  # (used by `vaddvq_f64` in simd::neon::mel_filterbank_dot) is unsupported. NEON is the
+  # aarch64 baseline so the dispatcher routes there under Miri, hitting the unsupported
+  # intrinsic on the second test case.
+  #
+  # x86_64 Miri works because runtime feature detection returns false for AVX2/AVX-512,
+  # so the dispatcher falls through to the scalar reference. Miri verifies the scalar
+  # kernel (which is 100% safe Rust) and the dispatcher control flow.
+  #
+  # Re-enable aarch64 Miri when stdarch's faddv emulation lands.
   miri-tb:
     name: miri-tb-${{ matrix.target }}
     strategy:
@@ -184,8 +213,6 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -210,8 +237,6 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
