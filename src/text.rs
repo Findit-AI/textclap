@@ -67,10 +67,10 @@ fn force_batch_longest_padding(tokenizer: &mut Tokenizer, pad_id: i64) {
 /// Reject `Padding::Fixed` for `from_ort_session` callers. See spec §7.4. Used by Task 24.
 #[allow(dead_code)] // Used by Task 24 from_ort_session.
 fn reject_fixed_padding(tokenizer: &Tokenizer) -> Result<()> {
-  if let Some(p) = tokenizer.get_padding() {
-    if matches!(p.strategy, PaddingStrategy::Fixed(_)) {
-      return Err(Error::PaddingFixedRejected);
-    }
+  if let Some(p) = tokenizer.get_padding()
+    && matches!(p.strategy, PaddingStrategy::Fixed(_))
+  {
+    return Err(Error::PaddingFixedRejected);
   }
   Ok(())
 }
