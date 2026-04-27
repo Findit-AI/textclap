@@ -85,7 +85,10 @@ fn text_embeddings_match_golden() {
   clap.warmup().expect("warmup");
 
   let labels = ["a dog barking", "rain", "music", "silence", "door creaking"];
-  let embs = clap.text_mut().embed_batch(&labels).expect("embed_batch");
+  let embs: Vec<Embedding> = labels
+    .iter()
+    .map(|label| clap.text_mut().embed(label).expect("embed"))
+    .collect();
 
   let golden = read_npy_f32("tests/fixtures/golden_text_embs.npy");
   assert_eq!(golden.len(), 5 * 512);
