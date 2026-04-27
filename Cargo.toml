@@ -44,7 +44,7 @@ workspace = true
 [workspace.lints.rust]
 rust_2018_idioms      = "warn"
 single_use_lifetimes  = "warn"
-unexpected_cfgs       = { level = "warn", check-cfg = ['cfg(all_tests)', 'cfg(tarpaulin)'] }
+unexpected_cfgs       = { level = "warn", check-cfg = ['cfg(all_tests)', 'cfg(tarpaulin)', 'cfg(textclap_force_scalar)'] }
 
 [package.metadata.docs.rs]
 all-features  = true

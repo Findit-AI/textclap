@@ -1,0 +1,137 @@
+//! SIMD backends for the three hot kernels in textclap.
+//!
+//! The scalar reference ([`scalar`]) is always available and always
+//! bit-identical to the original Rust loops in `mel.rs` and `audio.rs`.
+//! Per-architecture backends ([`neon`], [`x86_avx2`]) are selected at
+//! runtime via `is_*_feature_detected!`. Each SIMD kernel itself carries
+//! `#[target_feature(enable = "...")]` so its intrinsics execute in an
+//! explicitly feature-enabled context rather than one merely inherited
+//! from the target's default features.
+//!
+//! `unsafe` is confined to the [`neon`] / [`x86_avx2`] submodules. The
+//! scalar reference plus this dispatcher contain no `unsafe` blocks. The
+//! crate-level lint [`unsafe_op_in_unsafe_fn`](https://doc.rust-lang.org/rustc/lints/listing/deny-by-default.html#unsafe-op-in-unsafe-fn)
+//! requires every intrinsic call inside a backend kernel to sit in an
+//! explicit `unsafe { ... }` block with its own `// SAFETY:` justification.
+//!
+//! Output guarantees: every backend is byte-identical to [`scalar`].
+//! Equivalence tests in Tasks SIMD-2/3/4 enforce that contract.
+//!
+//! Dispatcher `cfg_select!` requires Rust 1.95+ (stable, in the core
+//! prelude — no import needed). The crate's MSRV matches.
+//!
+//! Setting `--cfg textclap_force_scalar` at build time forces every
+//! dispatcher down the scalar path, regardless of CPU features. Useful
+//! for benchmarking scalar-vs-SIMD on the same input and for forcing
+//! the scalar fallback's coverage on runners that would otherwise always
+//! pick a SIMD tier.
+
+#[cfg(target_arch = "aarch64")]
+mod neon;
+mod scalar;
+#[cfg(target_arch = "x86_64")]
+mod x86_avx2;
+
+use rustfft::num_complex::Complex;
+
+/// Compute `out[i] = buf[i].re² + buf[i].im²` for every element. Dispatches
+/// to the best available backend; falls back to [`scalar::power_spectrum_into`]
+/// when no SIMD backend is available.
+///
+/// See [`scalar::power_spectrum_into`] for the full semantic specification.
+pub(crate) fn power_spectrum_into(buf: &[Complex<f64>], out: &mut [f64]) {
+  cfg_select! {
+    target_arch = "aarch64" => {
+      if neon_available() {
+        // SAFETY: `neon_available()` verified NEON is present on this CPU.
+        unsafe { neon::power_spectrum_into(buf, out); }
+        return;
+      }
+    },
+    target_arch = "x86_64" => {
+      if avx2_fma_available() {
+        // SAFETY: `avx2_fma_available()` verified AVX2 + FMA are present on this CPU.
+        unsafe { x86_avx2::power_spectrum_into(buf, out); }
+        return;
+      }
+    },
+    _ => {
+      // Targets without a SIMD backend (riscv64, powerpc, …) fall through
+      // to the scalar path below.
+    }
+  }
+  scalar::power_spectrum_into(buf, out);
+}
+
+/// Compute `Σ weights[i] * power[i]`. Dispatches to the best available
+/// backend; falls back to [`scalar::mel_filterbank_dot`] when no SIMD
+/// backend is available.
+///
+/// See [`scalar::mel_filterbank_dot`] for the full semantic specification.
+pub(crate) fn mel_filterbank_dot(weights: &[f64], power: &[f64]) -> f64 {
+  cfg_select! {
+    target_arch = "aarch64" => {
+      if neon_available() {
+        // SAFETY: `neon_available()` verified NEON is present on this CPU.
+        return unsafe { neon::mel_filterbank_dot(weights, power) };
+      }
+    },
+    target_arch = "x86_64" => {
+      if avx2_fma_available() {
+        // SAFETY: `avx2_fma_available()` verified AVX2 + FMA are present on this CPU.
+        return unsafe { x86_avx2::mel_filterbank_dot(weights, power) };
+      }
+    },
+    _ => {}
+  }
+  scalar::mel_filterbank_dot(weights, power)
+}
+
+/// Returns `Some(i)` of the first non-finite (NaN or ±∞) sample, or `None`
+/// if every sample is finite. Dispatches to the best available backend;
+/// falls back to [`scalar::first_non_finite`] when no SIMD backend is
+/// available.
+///
+/// See [`scalar::first_non_finite`] for the full semantic specification.
+pub(crate) fn first_non_finite(samples: &[f32]) -> Option<usize> {
+  cfg_select! {
+    target_arch = "aarch64" => {
+      if neon_available() {
+        // SAFETY: `neon_available()` verified NEON is present on this CPU.
+        return unsafe { neon::first_non_finite(samples) };
+      }
+    },
+    target_arch = "x86_64" => {
+      if avx2_fma_available() {
+        // SAFETY: `avx2_fma_available()` verified AVX2 + FMA are present on this CPU.
+        return unsafe { x86_avx2::first_non_finite(samples) };
+      }
+    },
+    _ => {}
+  }
+  scalar::first_non_finite(samples)
+}
+
+/// NEON availability on aarch64. `std::arch::is_aarch64_feature_detected!`
+/// caches its result in an atomic, so per-call overhead is a single relaxed
+/// load plus a branch.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(tarpaulin), inline(always))]
+fn neon_available() -> bool {
+  if cfg!(textclap_force_scalar) {
+    return false;
+  }
+  std::arch::is_aarch64_feature_detected!("neon")
+}
+
+/// AVX2 + FMA availability on x86_64. Both must be present for the AVX2
+/// backend (FMA is needed for the fused multiply-add in
+/// [`mel_filterbank_dot`]).
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(tarpaulin), inline(always))]
+fn avx2_fma_available() -> bool {
+  if cfg!(textclap_force_scalar) {
+    return false;
+  }
+  std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+}
