@@ -165,9 +165,13 @@ mod tests {
     let mut s = seed;
     (0..n)
       .map(|_| {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+          .wrapping_mul(6364136223846793005)
+          .wrapping_add(1442695040888963407);
         let re = ((s >> 33) as i32 as f64) / i32::MAX as f64;
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+          .wrapping_mul(6364136223846793005)
+          .wrapping_add(1442695040888963407);
         let im = ((s >> 33) as i32 as f64) / i32::MAX as f64;
         Complex::new(re, im)
       })
@@ -181,7 +185,9 @@ mod tests {
     let mut s = seed;
     (0..n)
       .map(|_| {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+          .wrapping_mul(6364136223846793005)
+          .wrapping_add(1442695040888963407);
         ((s >> 33) as i32 as f64) / i32::MAX as f64
       })
       .collect()
