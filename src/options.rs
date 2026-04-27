@@ -69,9 +69,14 @@ mod graph_optimization_level {
     OptimizationLevel::deserialize(deserializer).map(Into::into)
   }
 
+  /// Serde-defaults helper for `Options::optimization_level`.
+  ///
+  /// Returns `GraphOptimizationLevel::Level3` to match `Options::new()`,
+  /// so deserializing an `Options` with `optimization_level` missing
+  /// produces the same value as `Options::default()`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn default() -> GraphOptimizationLevel {
-    GraphOptimizationLevel::Disable
+    GraphOptimizationLevel::Level3
   }
 }
 
