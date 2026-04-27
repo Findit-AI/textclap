@@ -97,10 +97,11 @@ impl Embedding {
 
   /// Construct from any non-zero finite slice; always re-normalizes to unit length.
   /// Validates length, rejects all-zero input via `EmbeddingZero`, rejects any non-finite component
-  /// via `NonFiniteEmbedding`. See spec §7.5.
+  /// via `NonFiniteEmbedding`. Also rejects inputs whose norm would overflow f32 representation.
+  /// See spec §7.5.
   ///
-  /// **Cost.** ~100 ns over 512 components (finiteness scan + L2 norm). For bulk hot-path import
-  /// where upstream guarantees finiteness and unit-norm, prefer `try_from_unit_slice`.
+  /// **Cost.** ~100 ns over 512 components (finiteness scan + L2 norm in f64). For bulk hot-path
+  /// import where upstream guarantees finiteness and unit-norm, prefer `try_from_unit_slice`.
   pub fn from_slice_normalizing(s: &[f32]) -> Result<Self> {
     if s.len() != 512 {
       return Err(Error::EmbeddingDimMismatch {
@@ -113,11 +114,22 @@ impl Embedding {
         return Err(Error::NonFiniteEmbedding { component_index: i });
       }
     }
-    let norm_sq: f32 = s.iter().map(|x| x * x).sum();
-    if norm_sq == 0.0 {
+    // Accumulate in f64 to avoid f32 overflow when |x| ≳ 1.85e19. For any finite f32 input
+    // (|x| ≤ ~3.4e38), x_f64 * x_f64 ≤ ~1.16e77 and 512 such terms sum to at most ~5.9e79,
+    // well within f64's ~1.8e308 range. The f64 accumulator is therefore guaranteed finite.
+    let norm_sq_f64: f64 = s.iter().map(|&x| (x as f64) * (x as f64)).sum();
+    if norm_sq_f64 == 0.0 {
       return Err(Error::EmbeddingZero);
     }
-    let inv_norm = 1.0 / norm_sq.sqrt();
+    let inv_norm_f64 = 1.0_f64 / norm_sq_f64.sqrt();
+    // Cast to f32 for the per-component multiply. If norm_sq is so large that
+    // 1/sqrt(norm_sq) is below f32::MIN_POSITIVE (~1.18e-38), the cast collapses to
+    // zero and normalization degenerates. Reject as `EmbeddingZero` — the magnitude
+    // exceeds what f32 can normalize.
+    let inv_norm = inv_norm_f64 as f32;
+    if inv_norm == 0.0 || !inv_norm.is_finite() {
+      return Err(Error::EmbeddingZero);
+    }
     let mut inner = [0.0f32; 512];
     for (out, &v) in inner.iter_mut().zip(s.iter()) {
       *out = v * inv_norm;
@@ -424,6 +436,63 @@ mod tests {
       err,
       Error::NonFiniteEmbedding { component_index: 7 }
     ));
+  }
+
+  #[test]
+  fn from_slice_normalizing_handles_overflow_magnitude() {
+    // Regression for the f32-overflow bug: pre-fix, components >= ~1.85e19 caused x*x to
+    // overflow to +Inf in the f32 accumulator, then 1/sqrt(Inf) = 0, and the function
+    // silently returned an all-zero Embedding via Ok — violating the unit-norm invariant.
+    //
+    // With the f64 accumulator, the norm is computable for any finite f32 input. Even at
+    // f32::MAX, the inverse-norm lands in the f32 subnormal range (~1.18e-45 .. 1.18e-38),
+    // which is small but representable, so normalization succeeds and returns a true
+    // unit-norm Embedding (rather than a silent all-zero result).
+    let mut s = [0.0f32; 512];
+    s[0] = f32::MAX;
+    let e = Embedding::from_slice_normalizing(&s).expect("f32::MAX should normalize via f64");
+    let norm_sq: f32 = e.as_slice().iter().map(|x| x * x).sum();
+    assert!(
+      (norm_sq - 1.0).abs() < 1e-4,
+      "result not unit-norm: norm_sq = {norm_sq}"
+    );
+    // Confirm we did NOT return the silent all-zero result that the f32 path would.
+    assert!(
+      e.as_slice().iter().any(|&x| x != 0.0),
+      "embedding collapsed to all-zero (regression to f32-overflow bug)"
+    );
+  }
+
+  #[test]
+  fn from_slice_normalizing_handles_subnormal_magnitude() {
+    // Tiny subnormal-scale inputs should still normalize correctly (norm is non-zero in f64,
+    // 1/sqrt(norm) is large but finite, normalized output is unit-norm).
+    let mut s = [0.0f32; 512];
+    for v in s.iter_mut() {
+      *v = f32::MIN_POSITIVE; // smallest normal positive f32
+    }
+    let e = Embedding::from_slice_normalizing(&s).expect("should normalize");
+    let norm_sq: f32 = e.as_slice().iter().map(|x| x * x).sum();
+    assert!(
+      (norm_sq - 1.0).abs() < 1e-4,
+      "result not unit-norm: norm_sq = {norm_sq}"
+    );
+  }
+
+  #[test]
+  fn from_slice_normalizing_handles_large_but_normalizable() {
+    // 1e15 components: x*x = 1e30 in f32 (still finite), norm_sq ≈ 5.12e32, inv_norm ≈ 4.4e-17,
+    // representable in f32. Should normalize successfully.
+    let mut s = [0.0f32; 512];
+    for v in s.iter_mut() {
+      *v = 1e15_f32;
+    }
+    let e = Embedding::from_slice_normalizing(&s).expect("should normalize");
+    let norm_sq: f32 = e.as_slice().iter().map(|x| x * x).sum();
+    assert!(
+      (norm_sq - 1.0).abs() < 1e-4,
+      "result not unit-norm: norm_sq = {norm_sq}"
+    );
   }
 
   #[test]
