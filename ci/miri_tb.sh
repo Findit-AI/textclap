@@ -14,18 +14,6 @@ if [ "$(uname)" = "Linux" ]; then
     aarch64-unknown-linux-gnu)
       sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
       ;;
-    i686-unknown-linux-gnu)
-      sudo apt-get update && sudo apt-get install -y gcc-multilib
-      ;;
-    powerpc64-unknown-linux-gnu)
-      sudo apt-get update && sudo apt-get install -y gcc-powerpc64-linux-gnu
-      ;;
-    s390x-unknown-linux-gnu)
-      sudo apt-get update && sudo apt-get install -y gcc-s390x-linux-gnu
-      ;;
-    riscv64gc-unknown-linux-gnu)
-      sudo apt-get update && sudo apt-get install -y gcc-riscv64-linux-gnu
-      ;;
   esac
 fi
 
@@ -35,4 +23,7 @@ cargo miri setup
 
 export MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-symbolic-alignment-check -Zmiri-tree-borrows"
 
-cargo miri test --all-targets --target "$TARGET"
+# Library tests only — textclap's integration tests require ORT FFI which
+# Miri cannot simulate. The lib tests are pure compute and exercise the
+# unsafe SIMD paths (pointer arithmetic, target_feature dispatch).
+cargo miri test --lib --target "$TARGET"
