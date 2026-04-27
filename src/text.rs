@@ -3,7 +3,10 @@
 use std::path::Path;
 
 use ort::{session::Session, value::TensorRef};
-use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
+use tokenizers::{
+  PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationDirection,
+  TruncationParams, TruncationStrategy,
+};
 
 use crate::{
   audio::validate_shape,
@@ -19,6 +22,13 @@ const TEXT_INPUT_IDS_NAME: &str = "input_ids";
 const TEXT_OUTPUT_NAME: &str = "text_embeds";
 
 const TEXT_OUTPUT_IS_UNIT_NORM: bool = false;
+
+/// Maximum input tokens accepted by the text encoder. Backfilled from the pinned ONNX
+/// graph's position-embedding table size (514 = 512 actual tokens + 2 RoBERTa special
+/// offsets). Tokens beyond this length would index out of the position table and crash
+/// the ORT Gather op. All three constructors install tokenizer-side truncation at this
+/// length, matching standard RoBERTa convention.
+const TEXT_MAX_TOKENS: usize = 512;
 
 const EMBEDDING_DIM: usize = 512;
 
@@ -66,6 +76,21 @@ fn force_batch_longest_padding(tokenizer: &mut Tokenizer, pad_id: i64) {
   }));
 }
 
+/// Force `LongestFirst` truncation at `TEXT_MAX_TOKENS` on the tokenizer. Used by all
+/// three constructors. The model's position-embedding table is fixed at 514 entries, so
+/// truncation is a hard model constraint rather than a tunable preference. See spec §7.4.
+fn force_max_length_truncation(tokenizer: &mut Tokenizer) -> Result<()> {
+  tokenizer
+    .with_truncation(Some(TruncationParams {
+      max_length: TEXT_MAX_TOKENS,
+      strategy: TruncationStrategy::LongestFirst,
+      stride: 0,
+      direction: TruncationDirection::Right,
+    }))
+    .map_err(Error::TokenizerLoadFromMemory)?;
+  Ok(())
+}
+
 /// Reject `Padding::Fixed` for `from_ort_session` callers. See spec §7.4.
 fn reject_fixed_padding(tokenizer: &Tokenizer) -> Result<()> {
   if let Some(p) = tokenizer.get_padding()
@@ -107,6 +132,7 @@ impl TextEncoder {
       })?;
     let pad_id = resolve_pad_id(&tokenizer)?;
     force_batch_longest_padding(&mut tokenizer, pad_id);
+    force_max_length_truncation(&mut tokenizer)?;
     Self::from_pieces(session, tokenizer, pad_id)
   }
 
@@ -126,14 +152,22 @@ impl TextEncoder {
       Tokenizer::from_bytes(tokenizer_json_bytes).map_err(Error::TokenizerLoadFromMemory)?;
     let pad_id = resolve_pad_id(&tokenizer)?;
     force_batch_longest_padding(&mut tokenizer, pad_id);
+    force_max_length_truncation(&mut tokenizer)?;
     Self::from_pieces(session, tokenizer, pad_id)
   }
 
   /// Wrap a pre-built ORT session and tokenizer. The tokenizer's padding configuration is
   /// preserved (`BatchLongest`/`Longest`/none); `Padding::Fixed` is rejected to prevent silent
-  /// max_length truncation. See spec §7.4.
-  pub fn from_ort_session(session: Session, tokenizer: Tokenizer, _opts: Options) -> Result<Self> {
+  /// max_length truncation. Truncation is forced to `TEXT_MAX_TOKENS = 512` because the ONNX
+  /// position-embedding table cannot be exceeded — overlong input would crash the Gather op
+  /// rather than produce a meaningful embedding. See spec §7.4.
+  pub fn from_ort_session(
+    session: Session,
+    mut tokenizer: Tokenizer,
+    _opts: Options,
+  ) -> Result<Self> {
     reject_fixed_padding(&tokenizer)?;
+    force_max_length_truncation(&mut tokenizer)?;
     let pad_id = resolve_pad_id(&tokenizer)?;
     Self::from_pieces(session, tokenizer, pad_id)
   }

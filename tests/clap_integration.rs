@@ -214,6 +214,35 @@ fn embed_batch_matches_per_label_embed() {
   }
 }
 
+/// Regression for the Codex round-3 finding: overlong text inputs must be truncated at
+/// the model's position-embedding limit, not crash ORT with an out-of-bounds Gather.
+/// Standard RoBERTa convention: max 512 tokens.
+#[test]
+fn embed_truncates_overlong_text() {
+  let Some(dir) = models_dir() else {
+    eprintln!("skipping: TEXTCLAP_MODELS_DIR not set");
+    return;
+  };
+  let mut clap = textclap::Clap::from_files(
+    dir.join("audio_model_quantized.onnx"),
+    dir.join("text_model_quantized.onnx"),
+    dir.join("tokenizer.json"),
+    textclap::Options::new(),
+  )
+  .expect("Clap::from_files");
+
+  // ~3000-character query that tokenizes to far more than 512 tokens.
+  let long_text = "the quick brown fox jumps over the lazy dog ".repeat(80);
+  assert!(long_text.len() > 3000);
+
+  // Should NOT panic, NOT return Err — truncation is silent at the tokenizer.
+  let emb = clap
+    .text_mut()
+    .embed(&long_text)
+    .expect("embed should succeed via truncation");
+  assert_eq!(emb.dim(), 512);
+}
+
 #[test]
 fn classify_discrimination_check() {
   let Some(dir) = models_dir() else {
