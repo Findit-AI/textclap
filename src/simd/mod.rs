@@ -2,13 +2,15 @@
 //!
 //! The scalar reference ([`scalar`]) is always available and always
 //! bit-identical to the original Rust loops in `mel.rs` and `audio.rs`.
-//! Per-architecture backends ([`neon`], [`x86_avx2`]) are selected at
-//! runtime via `is_*_feature_detected!`. Each SIMD kernel itself carries
-//! `#[target_feature(enable = "...")]` so its intrinsics execute in an
-//! explicitly feature-enabled context rather than one merely inherited
-//! from the target's default features.
+//! Per-architecture backends ([`neon`], [`x86_avx512`], [`x86_avx2`],
+//! [`wasm_simd128`]) are selected at runtime via `is_*_feature_detected!`
+//! on aarch64 / x86_64, and at compile time via `cfg!(target_feature =
+//! "simd128")` on wasm32 (WASM has no runtime CPU detection). Each
+//! SIMD kernel itself carries `#[target_feature(enable = "...")]` so its
+//! intrinsics execute in an explicitly feature-enabled context rather
+//! than one merely inherited from the target's default features.
 //!
-//! `unsafe` is confined to the [`neon`] / [`x86_avx2`] submodules. The
+//! `unsafe` is confined to the architecture-specific submodules. The
 //! scalar reference plus this dispatcher contain no `unsafe` blocks. The
 //! crate-level lint [`unsafe_op_in_unsafe_fn`](https://doc.rust-lang.org/rustc/lints/listing/deny-by-default.html#unsafe-op-in-unsafe-fn)
 //! requires every intrinsic call inside a backend kernel to sit in an
@@ -16,12 +18,13 @@
 //!
 //! Output guarantees: [`power_spectrum_into`] is byte-identical to
 //! [`scalar`] across all backends. [`mel_filterbank_dot`] is the
-//! exception — its NEON / AVX2 backends use FMA + 2x ILP, so they
-//! reassociate the summation tree and round once instead of twice.
+//! exception — its NEON / AVX-512 / AVX2 backends use FMA + 2x ILP, so
+//! they reassociate the summation tree and round once instead of twice.
 //! Drift is bounded at `1e-10 * scale` (loose; see backend doc
 //! comments) — far below the integration golden mel tolerance of
-//! `1e-4`. Equivalence tests in Tasks SIMD-2/3/4 enforce these
-//! contracts.
+//! `1e-4`. The wasm32 simd128 backend has no FMA available, so its
+//! `mel_filterbank_dot` matches the scalar rounding tree exactly.
+//! Equivalence tests in Tasks SIMD-2/3/4 enforce these contracts.
 //!
 //! Dispatcher `cfg_select!` requires Rust 1.95+ (stable, in the core
 //! prelude — no import needed). The crate's MSRV matches.
@@ -32,35 +35,48 @@
 //! the scalar fallback's coverage on runners that would otherwise always
 //! pick a SIMD tier.
 //!
-//! # Backend coverage: why NEON + AVX2+FMA, but not AVX-512 or SSE4.1
+//! # Backend coverage: four active SIMD tiers plus scalar fallback
 //!
-//! The crate ships two architecture-specific backends. The omitted tiers
-//! were considered and deliberately left out for v0.1.0:
+//! The crate ships four architecture-specific backends. The dispatcher
+//! routes each call to the best available tier:
 //!
-//! ## AVX-512 (omitted)
+//! ## NEON (aarch64)
 //!
-//! - **Apple Silicon — the primary aarch64 target — has no AVX-512 path
-//!   regardless,** so adding it benefits only x86_64 deployments.
-//! - **Mixed CPU support on x86_64.** Intel disabled AVX-512 on consumer
-//!   12th-gen and later (E-cores lack it; the P-cores' support is fused
-//!   off for SKU consistency). AMD added it from Zen 4 (2022). A binary
-//!   that runtime-detects AVX-512 and uses it where available still has
-//!   to bring an AVX2 backend for the majority case.
-//! - **Modest real-world speedup for this workload.** Doubling the lane
-//!   count from 4 to 8 f64 sounds attractive, but the kernels here are
-//!   memory-bandwidth-bound at their working set sizes. AVX-512 also
-//!   triggers down-clocking on older CPUs, which can erase the lane-count
-//!   win on mixed workloads. Measured 20–30% gains are typical, not 2×.
-//! - **Doubles the testing surface.** Each new tier adds an equivalence
-//!   test against the scalar reference and an integration-golden gate
-//!   per kernel. The existing NEON + AVX2 backends already cover the
-//!   common deployments; a third tier is added complexity without a
-//!   matching coverage gain.
+//! Selected when `is_aarch64_feature_detected!("neon")` returns true —
+//! universally true on Apple Silicon and modern aarch64 servers (NEON
+//! has been mandatory in ARMv8-A baseline). 2-lane f64 / 4-lane f32 via
+//! `float64x2_t` / `float32x4_t`, FMA via `vfmaq_f64`, single-instruction
+//! horizontal reductions (`vaddvq_f64`, `vmaxvq_u32`).
 //!
-//! AVX-512 can be added in a later release if profiling identifies a
-//! specific deployment where the lane-count win clearly beats the
-//! scalar path on hot kernels. The dispatcher pattern accommodates a
-//! new backend without touching call sites.
+//! ## AVX-512 (x86_64, runtime-detected)
+//!
+//! Selected when `is_x86_feature_detected!("avx512f")` returns true.
+//! AVX-512F implies AVX2 + FMA on every shipped x86_64 CPU (Intel
+//! Skylake-X+, AMD Zen 4+), so a single AVX-512F runtime check is
+//! sufficient. 8-lane f64 / 16-lane f32 — twice the AVX2 lane count.
+//! Uses `_mm512_fmadd_pd` for `mel_filterbank_dot`, `_mm512_reduce_add_pd`
+//! for the horizontal sum, and 16-bit mask registers for the
+//! `first_non_finite` existence test. Falls through to AVX2 on CPUs
+//! that lack AVX-512F (notably Intel consumer 12th-gen+ and AMD Zen 1–3).
+//!
+//! ## AVX2 + FMA (x86_64, runtime-detected)
+//!
+//! Selected when `is_x86_feature_detected!("avx2") &&
+//! is_x86_feature_detected!("fma")` returns true and AVX-512F is not
+//! available. AVX2 has been baseline on Intel since Haswell (2013) and
+//! AMD since Excavator (2015). 4-lane f64 / 8-lane f32 with `_mm256_fmadd_pd`,
+//! `_mm256_hadd_pd`, and `_mm256_testz_si256` for the same kernel
+//! shapes as the AVX-512 backend at half the lane count.
+//!
+//! ## simd128 (wasm32, compile-time gated)
+//!
+//! Selected when `cfg!(target_feature = "simd128")` evaluates true at
+//! compile time. WASM has no runtime CPU feature detection — a module
+//! either was produced with simd128 opcodes (which require runtime
+//! support at instantiation) or it wasn't, so the gate is purely
+//! compile-time. 2-lane f64 / 4-lane f32, no FMA in the baseline
+//! proposal, so `mel_filterbank_dot` uses `f64x2_mul` + `f64x2_add` and
+//! is bit-identical to the scalar reference (no reassociation drift).
 //!
 //! ## SSE4.1 (omitted)
 //!
@@ -89,6 +105,8 @@
 #[cfg(target_arch = "aarch64")]
 mod neon;
 mod scalar;
+#[cfg(target_arch = "wasm32")]
+mod wasm_simd128;
 #[cfg(target_arch = "x86_64")]
 mod x86_avx2;
 #[cfg(target_arch = "x86_64")]
@@ -124,6 +142,15 @@ pub(crate) fn power_spectrum_into(buf: &[Complex<f64>], out: &mut [f64]) {
         return;
       }
     },
+    target_arch = "wasm32" => {
+      if simd128_available() {
+        // SAFETY: `simd128_available()` is a compile-time gate; if it
+        // returns true, the WASM module was produced with simd128 enabled
+        // and is being executed in a runtime that supports it.
+        unsafe { wasm_simd128::power_spectrum_into(buf, out); }
+        return;
+      }
+    },
     _ => {
       // Targets without a SIMD backend (riscv64, powerpc, …) fall through
       // to the scalar path below.
@@ -156,6 +183,13 @@ pub(crate) fn mel_filterbank_dot(weights: &[f64], power: &[f64]) -> f64 {
         return unsafe { x86_avx2::mel_filterbank_dot(weights, power) };
       }
     },
+    target_arch = "wasm32" => {
+      if simd128_available() {
+        // SAFETY: `simd128_available()` is a compile-time gate; if it
+        // returns true, the WASM module was produced with simd128 enabled.
+        return unsafe { wasm_simd128::mel_filterbank_dot(weights, power) };
+      }
+    },
     _ => {}
   }
   scalar::mel_filterbank_dot(weights, power)
@@ -184,6 +218,13 @@ pub(crate) fn first_non_finite(samples: &[f32]) -> Option<usize> {
       if avx2_fma_available() {
         // SAFETY: `avx2_fma_available()` verified AVX2 + FMA are present on this CPU.
         return unsafe { x86_avx2::first_non_finite(samples) };
+      }
+    },
+    target_arch = "wasm32" => {
+      if simd128_available() {
+        // SAFETY: `simd128_available()` is a compile-time gate; if it
+        // returns true, the WASM module was produced with simd128 enabled.
+        return unsafe { wasm_simd128::first_non_finite(samples) };
       }
     },
     _ => {}
@@ -226,6 +267,18 @@ fn avx512_available() -> bool {
     return false;
   }
   std::arch::is_x86_feature_detected!("avx512f")
+}
+
+/// simd128 availability on wasm32. WASM has **no runtime CPU detection**
+/// — a module either was produced with simd128 opcodes or it wasn't, and
+/// runtime support is verified at instantiation. So the gate is
+/// purely compile-time via `cfg!(target_feature = "simd128")`. The
+/// `textclap_force_scalar` cfg still applies for benchmarking parity
+/// with the other arches.
+#[cfg(target_arch = "wasm32")]
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn simd128_available() -> bool {
+  !cfg!(textclap_force_scalar) && cfg!(target_feature = "simd128")
 }
 
 #[cfg(test)]
