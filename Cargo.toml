@@ -39,6 +39,19 @@ hound     = "3"
 default = []
 serde   = ["dep:serde", "smol_str/serde", "dep:serde_with"]
 
+# ORT execution-provider passthroughs. Off by default; enabling a feature only
+# links the EP into ort-sys — downstream callers must still register the EP at
+# runtime via `Session::builder().with_execution_providers([...])`. CoreML on
+# the bundled HTSAT/RoBERTa int8 graphs is a verified slowdown; CUDA/DirectML
+# on equivalent fp16 exports are the more promising paths for users who want
+# to experiment.
+coreml   = ["ort/coreml"]
+directml = ["ort/directml"]
+cuda     = ["ort/cuda"]
+rocm     = ["ort/rocm"]
+tensorrt = ["ort/tensorrt"]
+openvino = ["ort/openvino"]
+
 [lints]
 workspace = true
 
